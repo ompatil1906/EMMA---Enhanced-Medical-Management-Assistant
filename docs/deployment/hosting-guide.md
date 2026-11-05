@@ -117,3 +117,4 @@ In the **Environment Variables** section, add:
 * **Render Free Tier Cold Starts:** Free instances spin down after 15 minutes of inactivity. When first connecting, the first request may take 30-50 seconds to wake up the container.
 * **Mixed Content (HTTP vs HTTPS):** Because Vercel serves the UI over HTTPS, browsers require all WebSocket connections to use **`wss://`** (secure WebSocket). Never use `ws://` on production Vercel.
 * **CORS:** The backend includes CORS middleware (`CORS_ORIGINS=*`) ensuring any cross-origin HTTP health checks from Vercel or external scripts succeed without restrictions.
+

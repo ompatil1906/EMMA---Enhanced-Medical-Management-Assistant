@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: emma-voice-gateway
+    runtime: docker
+    plan: free
+    region: oregon
+    rootDir: apps/voice-gateway
+    dockerfilePath: Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/live
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: EXOTEL_MODE
+        value: simulation
+      - key: WS_AUTH_TOKEN
+        sync: false
+      - key: CORS_ORIGINS
+        value: "*"

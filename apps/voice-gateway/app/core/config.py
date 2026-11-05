@@ -6,10 +6,11 @@ day's scope deliberately has no STT/LLM/TTS/etc. keys.
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,7 +25,8 @@ class Settings(BaseSettings):
     app_name: str = Field(default="emma-voice-gateway", alias="APP_NAME", frozen=True)
     APP_ENV: Literal["development", "test", "production"] = "development"
     APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8000
+    APP_PORT: int = Field(default=8000, validation_alias=AliasChoices("APP_PORT", "PORT"))
+    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     # --- Provider / simulation mode ---------------------------------------
@@ -45,6 +47,23 @@ class Settings(BaseSettings):
     # Exotel chunk guidance is 3,200–100,000 bytes decoded (verified defaults); the
     # minimum is NOT enforced inbound (logging only), the maximum is (tolerated error).
     EXOTEL_MAX_CHUNK_BYTES: int = Field(default=100_000, ge=1)
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _parse_cors_origins(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            v_str = value.strip()
+            if not v_str:
+                return ["*"]
+            if v_str.startswith("[") and v_str.endswith("]"):
+                try:
+                    return json.loads(v_str)
+                except Exception:
+                    pass
+            return [origin.strip() for origin in v_str.split(",") if origin.strip()]
+        if isinstance(value, list):
+            return value
+        return ["*"]
 
     @field_validator("EXOTEL_API_KEY", "EXOTEL_API_TOKEN", "WS_AUTH_TOKEN", mode="before")
     @classmethod

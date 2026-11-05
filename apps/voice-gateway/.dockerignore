@@ -1,0 +1,9 @@
+*
+!app
+!README.md
+!pyproject.toml
+!uv.lock
+__pycache__
+.venv
+.pytest_cache
+.ruff_cache

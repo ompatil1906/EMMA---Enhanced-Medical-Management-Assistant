@@ -31,6 +31,11 @@ async def server_url(monkeypatch, request) -> AsyncIterator[dict[str, str]]:
 
     for key, value in getattr(request, "param", {}).items():
         monkeypatch.setenv(key, value)
+    # Day-3 default pipeline selection: existing Day-2 integration tests pin the
+    # echo path explicitly unless a test requests the speech pipeline.
+    param = dict(getattr(request, "param", {}) or {})
+    if "VOICE_PIPELINE" not in param:
+        monkeypatch.setenv("VOICE_PIPELINE", "echo")  # Day-2 contract preservation
     config = uvicorn.Config(
         app=create_app(),
         host="127.0.0.1",

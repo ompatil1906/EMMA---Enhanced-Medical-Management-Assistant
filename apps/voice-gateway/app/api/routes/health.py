@@ -45,6 +45,11 @@ async def readiness(request: Request) -> JSONResponse:
         "ws_auth_required": settings.ws_auth_required,
         "active_sessions": state.registry.count(),
         "max_concurrent_sessions": settings.MAX_CONCURRENT_SESSIONS,
+        # Day-3 speech configuration (additive; echo mode ignores these).
+        "voice_pipeline": settings.VOICE_PIPELINE,
+        "stt_provider": str(settings.STT_PROVIDER),
+        "tts_provider": str(settings.TTS_PROVIDER),
+        "speech_provider_configured": settings.speech_provider_configured,
     }
     ready = state.ready and settings.provider_readiness_ok
     body = {"status": "ready" if ready else "degraded", "checks": checks}

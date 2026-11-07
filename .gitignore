@@ -23,3 +23,6 @@ build/
 # Logs & local artifacts
 *.log
 logs/
+
+# Day 8: Qdrant local persistent vector store (not committed)
+apps/voice-gateway/data/qdrant/

@@ -1,4 +1,4 @@
-# Local development runbook — EMMA voice gateway (Day 2)
+# Local development runbook — EMMA voice gateway (Day 2 + Day 3)
 
 Every command below was executed as written on macOS 27.2, Python 3.13.5,
 uv 0.9.x. Working directory notes first.
@@ -79,7 +79,7 @@ uv run python ../../scripts/websocket_simulator.py --ws-token <token>
 
 ```bash
 cd apps/voice-gateway
-uv run pytest                 # full suite (105 tests)
+uv run pytest                 # full suite (207 tests: Day-2 echo + Day-3 speech/mock)
 uv run pytest -q tests/unit   # unit only
 uv run pytest -v tests/integration/test_websocket_protocol.py
 uv run ruff format .          # formatting
@@ -98,6 +98,21 @@ uv run python ../../scripts/websocket_simulator.py   # from apps/voice-gateway
 docker compose down
 ```
 
+Day 3 compose adds the practice backend + MySQL (see
+`infrastructure/docker/docker-compose.yml`):
+
+```bash
+docker compose up -d            # mysql + practice-api + voice-gateway
+docker compose exec practice-api pnpm migration:run   # schema (migrations only)
+docker compose exec practice-api pnpm seed               # fictional practice
+docker compose ps -a             # healthchecks: mysql / practice-api / voice-gateway
+docker compose logs -f practice-api
+docker compose down -v          # -v removes the mysql_data volume
+```
+
+> Docker runtime status on the authoring machine: **not verified** (no Docker
+> daemon available). The compose file is authored but unexecuted — flag accordingly.
+
 ## 7. Troubleshooting quick refs
 
 | Symptom | Likely cause / fix |
@@ -110,9 +125,19 @@ docker compose down
 | `uv` resolves but tests fail to import `app` | run all commands from `apps/voice-gateway` (path contains `pythonpath=["."]`). |
 | Address already in use | previous uvicorn; `lsof -ti:8000` then kill. |
 
-## 8. What to change on Day 3
+## 8. What to change on Day 3 (now done) / Day 4
 
-* Add `AZURE_SPEECH_KEY/REGION` style settings in `app/core/config.py`.
-* Replace `echo_service.process` internals with VAD/STT (streaming), keep the
-  `AudioReceived → AudioToSend` signature so tests/adapter don't change.
-* Recheck Azure/Gemini free-tier caps before firing the first streaming call.
+Day 3 shipped the following runbook-level changes — all commands above were
+re-verified against the Day-3 tree:
+
+* `VOICE_PIPELINE=speech` is the new default; Day-2 tests pin `echo` explicitly
+  through the integration fixture params.
+* Speech env surface added: `STT_PROVIDER`, `TTS_PROVIDER`, `AZURE_SPEECH_*`,
+  `SPEECH_CONNECTION_TIMEOUT`, `SPEECH_REQUEST_TIMEOUT`, `MOCK_STT_*`.
+* Practice backend wiring: `PRACTICE_API_BASE_URL` (unset → persistence disabled).
+
+Day 4 items still pending:
+
+* Real Azure credentials wiring in `docker`/`.env` and live-mode onboarding.
+* LLM orchestration seam (Day-4) behind the deterministic handler.
+* Langfuse emission (Day-4).

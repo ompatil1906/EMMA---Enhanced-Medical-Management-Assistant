@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { openAudioPipeline, type AudioPipelineHandle } from "@/lib/voice/audio-pipeline";
-import { createDemoTransport } from "@/lib/voice/demo-transport";
 import { createGatewayTransport } from "@/lib/voice/gateway-transport";
+import { createDemoTransport } from "@/lib/voice/demo-transport";
 import type {
   TranscriptLine,
   VoiceEvent,
@@ -13,56 +13,24 @@ import type {
   VoiceState,
   VoiceTransport,
 } from "@/lib/voice/types";
-import { Brand } from "@/components/voice/brand";
+import { PhoneMockupCard } from "@/components/ui/phone-mockup";
+import { IntakeForm, type IntakeFormData } from "@/components/voice/intake-form";
+import { PhoneCallUI } from "@/components/voice/phone-call-ui";
 import { OrbStage } from "@/components/voice/orb-stage";
-import { VoiceControls } from "@/components/voice/controls";
 import { TranscriptBlock } from "@/components/voice/transcript";
-
-/* The voice screen — the single surface of the app. It owns:
-     · the typed state machine (VoiceState),
-     · the shared microphone pipeline (level metering + 20 ms PCM frames),
-     · one active transport (real gateway or labelled demo),
-     · quiet transcript + notice state.
-
-   Honesty invariant: the live gateway is an echo bridge — the UI reports
-   "echo verified" and never shows thinking/speaking/agent text in live mode.
-   Thinking, speaking and agent lines exist only in demo mode, where every
-   line is labelled as a sample and a permanent badge marks demo mode. */
+import { Mic, MicOff, PhoneOff, RefreshCcw } from "lucide-react";
+import Image from "next/image";
+import { cn } from "@/lib/utils";
 
 const GATEWAY_URL =
   process.env.NEXT_PUBLIC_VOICE_GATEWAY_URL ?? "ws://localhost:8000/ws/exotel";
 
-const LEVEL_INTERVAL_MS = 80; // ~12.5 Hz — the orb's springs smooth the rest
+const LEVEL_INTERVAL_MS = 80;
 
-const STATUS_TEXT: Record<VoiceState, string> = {
-  idle: "Ready to talk",
-  connecting: "Connecting…",
-  listening: "Listening…",
-  thinking: "Thinking…",
-  speaking: "Speaking…",
-  error: "Connection interrupted",
-};
-
-function helperFor(state: VoiceState, demo: boolean): string {
-  switch (state) {
-    case "idle":
-      return "Tap to start a conversation";
-    case "connecting":
-      return demo ? "Preparing demo preview…" : "Reaching the gateway…";
-    case "listening":
-      return demo
-        ? "Sample dialogue in play — your mic drives the orb"
-        : "Speak naturally — tap the red button to end";
-    case "thinking":
-      return "One moment…";
-    case "speaking":
-      return demo ? "Sample speech — tap skip to interrupt" : "Speaking…";
-    case "error":
-      return "The gateway could not be reached";
-  }
-}
+type PagePhase = "form" | "calling";
 
 export function VoiceScreen() {
+  /* ── voice engine state ─────────────────────────────────────────── */
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [demo, setDemo] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
@@ -72,12 +40,23 @@ export function VoiceScreen() {
   const [outputLevel, setOutputLevel] = useState(0);
   const [muted, setMuted] = useState(false);
 
+  /* ── page phase ─────────────────────────────────────────────────── */
+  const [phase, setPhase] = useState<PagePhase>("form");
+  const [callerData, setCallerData] = useState<IntakeFormData>({
+    firstName: "",
+    lastName: "",
+    mobile: "",
+    reason: "Book Appointment",
+  });
+
+  /* ── refs ───────────────────────────────────────────────────────── */
   const voiceStateRef = useRef<VoiceState>("idle");
   const busyRef = useRef(false);
   const pipelineRef = useRef<AudioPipelineHandle | null>(null);
   const transportRef = useRef<VoiceTransport | null>(null);
   const levelTimerRef = useRef<number | null>(null);
 
+  /* ── helpers ────────────────────────────────────────────────────── */
   const setVoiceStateTracked = (next: VoiceState) => {
     voiceStateRef.current = next;
     setVoiceState(next);
@@ -93,8 +72,7 @@ export function VoiceScreen() {
   const startLevelLoop = () => {
     if (levelTimerRef.current !== null) return;
     levelTimerRef.current = window.setInterval(() => {
-      const level = pipelineRef.current?.level() ?? 0;
-      setInputLevel(level);
+      setInputLevel(pipelineRef.current?.level() ?? 0);
     }, LEVEL_INTERVAL_MS);
   };
 
@@ -102,10 +80,8 @@ export function VoiceScreen() {
     if (!busyRef.current) return;
     busyRef.current = false;
     stopLevelLoop();
-
     transportRef.current?.stop();
     transportRef.current = null;
-
     const pipeline = pipelineRef.current;
     pipelineRef.current = null;
     await pipeline?.close();
@@ -114,58 +90,59 @@ export function VoiceScreen() {
     setOutputLevel(0);
     setMuted(false);
     setDemo(false);
-
     setVoiceStateTracked(reason === "error" ? "error" : "idle");
+    setPhase("form");
   };
 
   const onEvent = (event: VoiceEvent) => {
     switch (event.type) {
-      case "state": {
+      case "state":
         setVoiceStateTracked(event.state);
         break;
-      }
-      case "transcript": {
-        setTranscript((previous) => {
-          // A final line supersedes any pending partial transcription.
+      case "transcript":
+        setTranscript((prev) => {
           const base =
             event.line.kind === "partial"
-              ? previous
-              : previous.filter((line) => line.kind !== "partial");
+              ? prev
+              : prev.filter((l) => l.kind !== "partial");
           return [...base, event.line].slice(-6);
         });
         break;
-      }
-      case "notice": {
+      case "notice":
         setNotice(event.line);
         break;
-      }
-      case "metrics": {
+      case "metrics":
         setNotice({
           id: "metrics",
           text: `echo verified · ${event.metrics.framesOut} frames · ⌀ ${event.metrics.rttMsAvg ?? "—"} ms`,
           sample: false,
         });
         break;
-      }
-      case "output-level": {
+      case "output-level":
         setOutputLevel(event.level);
         break;
-      }
-      case "error": {
+      case "error":
         setErrorMessage(event.message);
         break;
-      }
-      case "ended": {
+      case "ended":
         void endSession(event.reason);
         break;
-      }
     }
+  };
+
+  const beginSession = (transport: VoiceTransport) => {
+    transportRef.current = transport;
+    startLevelLoop();
+    const ctx: VoiceSessionContext = {
+      onEvent,
+      micLevel: () => pipelineRef.current?.level() ?? 0,
+    };
+    transport.start(ctx);
   };
 
   const startSession = async (mode: VoiceMode) => {
     if (busyRef.current) return;
     busyRef.current = true;
-
     setVoiceStateTracked("connecting");
     setErrorMessage(null);
     setNotice(null);
@@ -181,9 +158,7 @@ export function VoiceScreen() {
         livePipeline = await openAudioPipeline();
       } catch {
         pipelineRef.current = null;
-        setErrorMessage(
-          "Microphone access was declined — allow the mic and try again",
-        );
+        setErrorMessage("Microphone access declined — please allow microphone permissions and tap retry");
         busyRef.current = false;
         setVoiceStateTracked("error");
         return;
@@ -191,28 +166,13 @@ export function VoiceScreen() {
       pipelineRef.current = livePipeline;
       beginSession(createGatewayTransport({ url: GATEWAY_URL, pipeline: livePipeline }));
     } else {
-      let demoPipeline: AudioPipelineHandle | null = null;
       try {
-        demoPipeline = await openAudioPipeline();
-        pipelineRef.current = demoPipeline;
+        pipelineRef.current = await openAudioPipeline();
       } catch {
-        // The demo preview runs without the mic too — the orb simply loses
-        // mic reactivity, which is fine for a labelled visual preview.
+        // demo preview runs without mic
       }
       beginSession(createDemoTransport());
     }
-  };
-
-  /** Shared tail of startSession once a transport exists. */
-  const beginSession = (transport: VoiceTransport) => {
-    transportRef.current = transport;
-    startLevelLoop();
-
-    const ctx: VoiceSessionContext = {
-      onEvent,
-      micLevel: () => pipelineRef.current?.level() ?? 0,
-    };
-    transport.start(ctx);
   };
 
   const toggleMute = () => {
@@ -223,15 +183,22 @@ export function VoiceScreen() {
     setMuted(next);
   };
 
-  // Release mic + socket on unmount (route change / HMR teardown).
+  /* ── user clicks "Call Now" on intake form ──────────────────────── */
+  const handleCallNow = (data: IntakeFormData) => {
+    setCallerData(data);
+    setPhase("calling");
+    void startSession("live");
+  };
+
+  /* ── teardown on unmount ────────────────────────────────────────── */
   useEffect(() => {
     return () => {
       stopLevelLoop();
       transportRef.current?.stop();
       transportRef.current = null;
-      const pipeline = pipelineRef.current;
+      const p = pipelineRef.current;
       pipelineRef.current = null;
-      void pipeline?.close();
+      void p?.close();
     };
   }, []);
 
@@ -240,51 +207,166 @@ export function VoiceScreen() {
       ? { id: "error", text: errorMessage, sample: false }
       : notice;
 
+  const isCalling = phase === "calling";
+
+  const STATUS_TEXT: Record<VoiceState, string> = {
+    idle: "Ready",
+    connecting: "Connecting…",
+    listening: "Listening",
+    thinking: "Processing",
+    speaking: "Speaking",
+    error: "Disconnected",
+  };
+
   return (
-    <main className="emma-screen relative flex min-h-svh flex-col overflow-hidden bg-[#050505] text-foreground">
-      <div aria-hidden className="emma-veil pointer-events-none absolute inset-0" />
+    <main className="relative flex min-h-svh w-full flex-col overflow-hidden bg-[#050507] text-white">
+      {/* Background subtle obsidian gradient (pure neutral dark, no blue) */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(255,255,255,0.03),transparent_70%)]"
+      />
 
-      <div className="relative z-10 flex min-h-svh flex-col">
-        <div
-          className="flex justify-center"
-          style={{ paddingTop: "max(1.75rem, env(safe-area-inset-top))" }}
-        >
-          <Brand />
-        </div>
-
-        <section className="min-h-0 flex-1">
-          <OrbStage
-            voiceState={voiceState}
-            inputLevel={inputLevel}
-            outputLevel={outputLevel}
-            statusText={STATUS_TEXT[voiceState]}
-            demo={demo}
-          />
-        </section>
-
-        <div
-          className="flex flex-col items-center gap-6"
-          style={{ paddingBottom: "max(1.6rem, env(safe-area-inset-bottom))" }}
-        >
-          <TranscriptBlock
-            lines={transcript}
-            notice={finalNotice}
-            noticeTone={voiceState === "error" ? "error" : "neutral"}
-          />
-
-          <VoiceControls
-            voiceState={voiceState}
-            muted={muted}
-            demo={demo}
-            onStart={() => void startSession("live")}
-            onEnd={() => void endSession("user")}
-            onToggleMute={toggleMute}
-            onRetry={() => void startSession("live")}
-            onDemo={() => void startSession("demo")}
-            onInterrupt={() => void endSession("user")}
-            helper={helperFor(voiceState, demo)}
+      {/* ── Top Bar: Logo on Left ──────────────────────────────────── */}
+      <header
+        className="relative z-20 flex w-full items-center justify-between px-6 py-4 md:px-10"
+        style={{ paddingTop: "max(1.25rem, env(safe-area-inset-top))" }}
+      >
+        {/* Left: Brand */}
+        <div className="flex select-none items-center">
+          <Image
+            src="/ql-logo.svg"
+            alt="QuantumLoopAI"
+            width={154}
+            height={22}
+            priority
+            draggable={false}
+            className="h-[20px] w-auto opacity-95"
           />
         </div>
+
+        {/* Right: Quick demo preview button if user wants to test speech simulation */}
+        {!isCalling && (
+          <button
+            onClick={() => {
+              setPhase("calling");
+              void startSession("demo");
+            }}
+            className="rounded-full border border-white/10 bg-white/[0.04] px-3.5 py-1.5 text-[11px] font-medium text-white/60 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white"
+          >
+            Preview Demo
+          </button>
+        )}
+      </header>
+
+      {/* ── Main Viewport Area ─────────────────────────────────────── */}
+      <div className="relative z-10 flex flex-1 flex-col items-center justify-center p-4">
+
+        {/* ── CENTER: Circular Voice Orb Stage (Visible in Calling Phase) ── */}
+        <div
+          className={cn(
+            "flex flex-col items-center justify-center transition-all duration-700 ease-out",
+            isCalling
+              ? "opacity-100 scale-100 pointer-events-auto"
+              : "opacity-0 scale-90 pointer-events-none absolute"
+          )}
+        >
+          {/* Volumetric Orb */}
+          <div className="relative h-[320px] w-[320px] md:h-[380px] md:w-[380px] flex items-center justify-center">
+            <OrbStage
+              voiceState={voiceState}
+              inputLevel={inputLevel}
+              outputLevel={outputLevel}
+              statusText={STATUS_TEXT[voiceState]}
+              demo={demo}
+            />
+          </div>
+
+          {/* Transcript Dialogue */}
+          <div className="mt-4 w-full max-w-md px-4">
+            <TranscriptBlock
+              lines={transcript}
+              notice={finalNotice}
+              noticeTone={voiceState === "error" ? "error" : "neutral"}
+            />
+          </div>
+
+          {/* Center Call Controls */}
+          <div className="mt-6 flex items-center gap-4">
+            {/* Mute toggle */}
+            <button
+              onClick={toggleMute}
+              className={cn(
+                "flex h-12 w-12 items-center justify-center rounded-full border transition active:scale-95",
+                muted
+                  ? "border-amber-400/30 bg-amber-500/20 text-amber-200"
+                  : "border-white/15 bg-white/[0.06] text-white hover:bg-white/[0.12]"
+              )}
+              title={muted ? "Unmute microphone" : "Mute microphone"}
+            >
+              {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+            </button>
+
+            {/* End Call Button */}
+            <button
+              onClick={() => void endSession("user")}
+              className="flex h-12 items-center gap-2 rounded-full border border-red-500/30 bg-red-600/90 px-6 text-[12px] font-semibold text-white shadow-[0_4px_20px_rgba(220,38,38,0.4)] transition hover:bg-red-500 hover:scale-105 active:scale-95"
+            >
+              <PhoneOff className="h-4 w-4" />
+              <span>End Conversation</span>
+            </button>
+
+            {/* Retry if error */}
+            {voiceState === "error" && (
+              <button
+                onClick={() => void startSession("live")}
+                className="flex h-12 w-12 items-center justify-center rounded-full border border-white/15 bg-white/[0.06] text-white hover:bg-white/[0.12]"
+                title="Retry call"
+              >
+                <RefreshCcw className="h-5 w-5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* ── PHONE MOCKUP (Center in form phase, Bottom-Right in calling phase) ── */}
+        <div
+          className={cn(
+            "transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]",
+            isCalling
+              ? "fixed bottom-6 right-6 z-40 w-[240px] md:bottom-8 md:right-8 md:w-[260px] drop-shadow-2xl"
+              : "relative w-[305px] sm:w-[325px]"
+          )}
+        >
+          <PhoneMockupCard
+            showDynamicIsland
+            className={cn(
+              "w-full transition-shadow duration-500",
+              isCalling && "shadow-[0_25px_60px_-10px_rgba(0,0,0,0.95),0_0_30px_rgba(255,255,255,0.06)]"
+            )}
+          >
+            {!isCalling ? (
+              <IntakeForm onCallNow={handleCallNow} />
+            ) : (
+              <PhoneCallUI
+                voiceState={voiceState}
+                muted={muted}
+                callerData={callerData}
+                outputLevel={outputLevel}
+                inputLevel={inputLevel}
+                onEnd={() => void endSession("user")}
+                onToggleMute={toggleMute}
+              />
+            )}
+          </PhoneMockupCard>
+        </div>
+
+        {/* Form helper note */}
+        {!isCalling && (
+          <p className="mt-4 text-center text-[11px] text-white/40 select-none">
+            Enter your details above and tap{" "}
+            <span className="font-semibold text-white/80">Call EMMA Reception</span> to start
+          </p>
+        )}
       </div>
     </main>
   );

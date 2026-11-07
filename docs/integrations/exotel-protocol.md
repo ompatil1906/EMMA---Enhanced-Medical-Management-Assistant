@@ -95,10 +95,33 @@ Audio math: `media.chunk` → `AudioReceived.payload` → `AudioToSend.payload` 
 outbound `media` envelope. **Byte-for-byte echo; no transcode, no resample.**
 Sequence/order metadata is kept in session counters.
 
+Day-3 addition (speech mode, see `docs/architecture/day-3-implementation.md`):
+the echo loop above was split into two loops driven by `VOICE_PIPELINE`:
+
+* `VOICE_PIPELINE=echo` — the Day-2 strict ping-pong loop, byte-for-byte.
+* `VOICE_PIPELINE=speech` — transport-only loop; inbound `media` frames flow into
+  the `VoicePipeline` (STT → FSM → response → TTS), outbound frames are produced by
+  a dedicated **pump task** draining the pipeline's outbound queue; outbound frames
+  are shaped by the framer (steady-state ≥ 3,200 B / target 32,000 B, turn-end flush).
+
+Speech-mode close-code extensions (same RFC 6455 policy family):
+
+| Situation | Gateway behaviour | Resulting close |
+|---|---|---|
+| `start` after pipeline lock with different media format (renegotiation) | Rejected — format was locked when the pipeline was built; **never resampled**. Redundant same-rate `start` tolerated. | 1008 `unsupported media renegotiation` |
+| Speech provider misconfigured at `start` (Azure selected, no key/region) | Fail clearly, degrade readiness, no silent fallback. | 1011 `speech provider not configured` |
+| Speech pipeline fatal failure (provider crash / fatal STT error / connect timeout) | FSM ERROR → ENDED; teardown guaranteed in `finally`. | 1011 `speech pipeline failed` |
+
+Audio math in speech mode: inbound frames go through the **explicit conversion
+layer** only when needed (`app/speech/audio_convert.py`); a format change after lock
+raises and closes 1008 — silent resampling is forbidden. Outbound frames are
+framed per the verified chunk guidance (3,200 B floor / 100,000 B ceiling) with our
+32,000 B target; turn-end flush may emit a smaller tail (documented exception).
+
 Documented deviation (deliberate): the verified outbound chunk **minimum**
 (3,200 bytes, [V14]) is NOT enforced inbound — our 20 ms test frames (320 B @
 8 kHz) are intentionally sub-minimum to exercise the transport. This is
-metadata-only today; the STT/TTS pipeline will impose real chunk-size policy.
+metadata-only today; the STT/TTS pipeline imposes real chunk-size policy.
 
 ---
 

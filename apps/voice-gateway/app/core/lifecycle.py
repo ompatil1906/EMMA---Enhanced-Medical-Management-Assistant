@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.domain.session import VoiceSession
+
+if TYPE_CHECKING:  # pragma: no cover
+    from app.integrations.embeddings.provider_factory import EmbeddingProviderFactory
+    from app.integrations.llm.provider_factory import LLMProviderFactory
+    from app.integrations.practice_api import PracticeApiClient
+    from app.integrations.vector_store.provider_factory import VectorStoreProviderFactory
+    from app.speech.factory import SpeechProviderFactory
 
 
 @dataclass
@@ -50,6 +58,14 @@ class GatewayState:
     started_at: float | None = None
     ready: bool = False
     registry: SessionRegistry = field(default_factory=SessionRegistry)
+    # Day-3: speech provider factory (built in create_app) + practice-API client.
+    speech_factory: SpeechProviderFactory | None = None
+    practice_client: PracticeApiClient | None = None
+    # Day-6: embedding provider factory + vector store factory (built in create_app).
+    embedding_factory: EmbeddingProviderFactory | None = None
+    vector_store_factory: VectorStoreProviderFactory | None = None
+    # Day-6: LLM provider factory (built in create_app).
+    llm_factory: LLMProviderFactory | None = None
 
     def mark_started(self) -> None:
         self.started_at = time.monotonic()

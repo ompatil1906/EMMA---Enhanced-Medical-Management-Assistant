@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    /* Language level */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    /* Modules: NodeNext per project policy. package.json intentionally has no
+       "type": "module", so emitted JavaScript is CommonJS (NodeFiles-Next
+       resolution applies). Relative imports therefore use explicit .js
+       suffixes in source; they resolve to sibling .ts files at design time and
+       to the real .js files after compilation. */
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    /* Strictness */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    /* Legacy assignment semantics are the safe pairing with legacy
+       experimentalDecorators + TypeORM entity fields (define-field semantics
+       would materialise `undefined` own-properties and fight TypeORM). */
+    "useDefineForClassFields": false,
+    /* Emitted-code behaviour */
+    "esModuleInterop": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    /* No emit here: IDE + ts-jest + eslint all reuse this config. Explicit
+       artifact builds (pnpm build) use tsconfig.build.json. */
+    "noEmit": true,
+    "incremental": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "migrations/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "data"]
+}

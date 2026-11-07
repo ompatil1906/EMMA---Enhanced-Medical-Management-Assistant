@@ -1,0 +1,60 @@
+{
+  "name": "@emma/practice-api",
+  "version": "0.1.0",
+  "description": "EMMA Day-3 practice data backend: strongly-typed NestJS 11 REST API over TypeORM (SQLite for dev/test, MySQL for prod/compose).",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "migration:run": "tsx scripts/migrate.ts up",
+    "migration:revert": "tsx scripts/migrate.ts revert",
+    "migration:status": "tsx scripts/migrate.ts status",
+    "seed": "tsx scripts/seed.ts",
+    "test": "jest --silent --runInBand",
+    "test:unit": "jest --silent --runInBand --selectProjects unit",
+    "test:db": "jest --silent --runInBand --selectProjects db"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.6",
+    "@nestjs/config": "^4.0.2",
+    "@nestjs/core": "^11.1.6",
+    "@nestjs/platform-express": "^11.1.6",
+    "@nestjs/swagger": "^11.2.0",
+    "@nestjs/typeorm": "^12.0.2",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.2",
+    "mysql2": "^3.15.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typeorm": "^0.3.27"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.10",
+    "@nestjs/schematics": "^11.0.9",
+    "@nestjs/testing": "^11.1.6",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.5",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^24.10.1",
+    "@types/supertest": "^6.0.3",
+    "better-sqlite3": "^12.6.0",
+    "eslint": "^9.39.1",
+    "jest": "^29.7.0",
+    "supertest": "^7.1.4",
+    "ts-jest": "^29.4.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

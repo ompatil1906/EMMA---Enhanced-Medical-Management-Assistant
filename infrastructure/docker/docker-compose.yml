@@ -1,4 +1,4 @@
-name: emma-day2
+name: emma-day3
 
 services:
   voice-gateway:
@@ -11,7 +11,20 @@ services:
       APP_ENV: production
       LOG_LEVEL: INFO
       EXOTEL_MODE: simulation
-      WS_AUTH_TOKEN: ${WS_AUTH_TOKEN:-}
+      VOICE_PIPELINE: speech
+      STT_PROVIDER: mock
+      TTS_PROVIDER: mock
+      SPEECH_CONNECTION_TIMEOUT: 10
+      SPEECH_REQUEST_TIMEOUT: 15
+      PRACTICE_API_BASE_URL: http://practice-api:3000
+      PRACTICE_ID: practice-riverbend-fictional
+      MAX_WS_MESSAGE_BYTES: 262144
+      MAX_CONSECUTIVE_ERRORS: 5
+      MAX_CONCURRENT_SESSIONS: 200
+      EXOTEL_MAX_CHUNK_BYTES: 100000
+    depends_on:
+      practice-api:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
       interval: 10s
@@ -20,5 +33,52 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-# Deliberately minimal (Day-2 scope): no MySQL/Qdrant/Redis/Langfuse — those
-# arrive on the days their services exist (Day 3+).
+  practice-api:
+    build:
+      context: ../..
+      dockerfile: apps/practice-api/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      APP_ENV: production
+      PORT: 3000
+      DB_DRIVER: mysql
+      DB_URL: mysql://emma:emma@mysql:3306/emma_practice
+      CORS_ORIGINS: http://localhost:5173
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/v1/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-emma_root_password}
+      MYSQL_DATABASE: emma_practice
+      MYSQL_USER: emma
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-emma}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  mysql_data:

@@ -47,8 +47,15 @@ class IntentInterpreter:
         self._prompt_version = prompt_version
         self._correlation_id = correlation_id
 
-    async def interpret(self, transcript: str, session_id: str) -> InterpretationResult:
+    async def interpret(
+        self, transcript: str, session_id: str, *, context: str | None = None
+    ) -> InterpretationResult:
         """Interpret one final transcript.
+
+        `context` is a bounded, server-built summary of the active dialogue
+        (active request fields, the field being awaited, pending confirmation,
+        previous grounded topic). It lets the model resolve references such as
+        a bare "Wednesday" without replaying the whole transcript.
 
         Raises `IntentInterpretationError` with `emergency=True` when the
         emergency guard matches — the caller must never reach the LLM.
@@ -71,6 +78,7 @@ class IntentInterpreter:
             timeout_seconds=self._timeout_seconds,
             max_output_tokens=self._max_output_tokens,
             correlation_id=self._correlation_id,
+            context=context,
         )
         try:
             response = await self._provider.interpret(request)

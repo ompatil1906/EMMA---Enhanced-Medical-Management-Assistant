@@ -28,6 +28,7 @@ responses and backend actions. The LLM never changes conversation state.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.domain.conversation import (
@@ -40,7 +41,116 @@ from app.domain.conversation import (
     TurnStatus,
     new_turn_id,
 )
-from app.domain.llm import InterpretationResult
+from app.domain.llm import InterpretationResult, RequestDetail
+
+# --- deterministic policy -------------------------------------------------
+
+# Only these request types enter the administrative request lifecycle.
+ADMIN_REQUEST_TYPES: frozenset[str] = frozenset(
+    {
+        "appointment-request",
+        "appointment-change-request",
+        "prescription-request",
+        "practice-administration",
+    }
+)
+
+# Fields the prototype actually needs before a request may be confirmed.
+# The backend accepts a free-form structured payload, so this is the existing
+# Day-5 practice policy (date + time for appointment requests); no extra
+# mandatory fields are introduced. The reason is captured when volunteered.
+REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "appointment-request": ("preferred_date", "preferred_time"),
+    "appointment-change-request": ("preferred_date", "preferred_time"),
+    "prescription-request": (),
+    "practice-administration": (),
+}
+
+_CONFIRM_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|correct|right|confirm|confirmed|okay|ok|"
+    r"please do|go ahead|submit it|that'?s right|that is right|sounds good|perfect)\b"
+)
+_REJECT_RE = re.compile(r"\b(no|nope|nah|negative|not now|not yet|don'?t|do not)\b")
+_CANCEL_RE = re.compile(r"\b(cancel|scrap|forget it|never ?mind|stop|withdraw)\b")
+_AMBIGUOUS_RE = re.compile(
+    r"\b(maybe|perhaps|possibly|not sure|unsure|i think so|i guess|don'?t know)\b"
+)
+
+# Tenant/identity fields are server-authoritative. A model must never be able
+# to choose which practice a request belongs to, so these keys are stripped
+# from extracted details before anything is stored or submitted.
+_FORBIDDEN_DETAIL_KEYS: frozenset[str] = frozenset(
+    {
+        "practice_id",
+        "practiceid",
+        "practice-id",
+        "tenant_id",
+        "tenantid",
+        "tenant-id",
+        "tenant",
+    }
+)
+
+
+def _sanitize_details(details: dict[str, str | None]) -> dict[str, str | None]:
+    """Drop model-supplied tenant/identity fields (server-side only)."""
+    return {
+        key: value
+        for key, value in details.items()
+        if key.strip().lower() not in _FORBIDDEN_DETAIL_KEYS
+    }
+
+
+_WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+_DATE_WORDS = _WEEKDAYS + ("today", "tomorrow", "this week", "next week")
+_TIME_WORDS = ("morning", "afternoon", "evening", "noon")
+
+
+def _extract_date_value(text: str) -> str | None:
+    """Return the last explicitly stated date phrase (correction wins)."""
+    lowered = text.lower()
+    matches: list[tuple[int, str]] = []
+    for word in _DATE_WORDS:
+        start = lowered.find(word)
+        while start != -1:
+            matches.append((start, word))
+            start = lowered.find(word, start + len(word))
+    if not matches:
+        return None
+    position, word = max(matches)
+    if lowered[:position].rstrip().endswith("next") and word not in ("this week", "next week"):
+        return f"next {word}"
+    return word
+
+
+def _extract_time_value(text: str) -> str | None:
+    """Return the last explicitly stated time-of-day preference."""
+    lowered = text.lower()
+    matches: list[tuple[int, str]] = []
+    for word in _TIME_WORDS:
+        start = lowered.find(word)
+        while start != -1:
+            matches.append((start, word))
+            start = lowered.find(word, start + len(word))
+    if not matches:
+        return None
+    return max(matches)[1]
+
+
+def _required_missing(request_type: str, details: dict[str, str | None]) -> list[str]:
+    """Compute missing required fields from deterministic policy."""
+    required = REQUIRED_FIELDS.get(request_type)
+    if required is None:
+        return []
+    return [field for field in required if not details.get(field)]
 
 
 @dataclass(frozen=True)
@@ -95,21 +205,40 @@ class ConversationController:
 
         Returns a `ControllerDecision`. The pipeline speaks `response_text`
         and, when `action == "submit"`, performs the backend submission.
+
+        The model's `missing_fields` are advisory only: required fields are
+        recomputed deterministically from `REQUIRED_FIELDS` so a model cannot
+        mark an incomplete request as ready for submission.
         """
 
         if result.intent == "unclear" or result.needs_clarification:
             return self._ask_clarification(result)
 
-        # Preserve all extracted requests independently.
-        for request in result.requests:
+        admin_requests = [
+            request for request in result.requests if request.request_type in ADMIN_REQUEST_TYPES
+        ]
+        if not admin_requests:
+            # Practice-information questions are routed to RAG by the pipeline;
+            # anything else with no administrative request is clarified.
+            return self._ask_clarification(result)
+
+        before = self._details_fingerprint()
+        for request in admin_requests:
+            details = _sanitize_details(dict(request.details))
+            missing = _required_missing(request.request_type, details)
             captured = AdministrativeRequest(
                 request_type=request.request_type,
-                details=request.details,
-                missing_fields=list(request.missing_fields),
+                details=details,
+                missing_fields=missing,
                 source_quotes=list(request.source_quotes),
                 turn_id=self.state.turn_sequence or None,
             )
             self.state.add_or_update_request(captured)
+
+        # Any newly supplied field counts as progress; reset the clarification
+        # budget so a caller is not cut off mid slot-fill.
+        if self._details_fingerprint() != before:
+            self.state.clarification_count = 0
 
         # Check for missing required fields across active requests.
         missing = self.state.collect_missing()
@@ -131,8 +260,17 @@ class ConversationController:
             )
 
         # All active fields captured → require explicit confirmation.
+        self.state.awaiting_field = None
         self.state.confirmation_pending = True
         self.state.confirmation_target = ConfirmationTarget.REQUEST
+        ready_types = [
+            req.request_type
+            for req in self.state.captured_requests
+            if req.is_active and req.status == RequestStatus.READY_FOR_CONFIRMATION
+        ]
+        self.state.confirmation_target_request_type = (
+            ready_types[0] if len(ready_types) == 1 else None
+        )
         return ControllerDecision(
             action="confirm",
             response_text=self._read_back_prompt(),
@@ -200,28 +338,21 @@ class ConversationController:
                 ),
             )
 
-        submissions = []
-        turn_id = new_turn_id()
-        for req in targets:
-            submissions.append(
-                {
-                    "requestType": req.request_type,
-                    "structuredPayload": req.details,
-                }
-            )
-            self.state.confirmed_submissions.append(req.request_type)
-            # Mark as submitting; the pipeline moves to SUBMITTED on backend
-            # confirmation or FAILED on backend rejection.
-            for i, existing in enumerate(self.state.captured_requests):
-                if existing.request_type == req.request_type and existing.is_active:
-                    self.state.captured_requests[i] = existing.mark_submitting(
-                        turn_id=turn_id,
-                        idempotency_key=f"{req.request_type}:{turn_id}",
-                    )
+        # Do NOT mark anything SUBMITTING or record a success here. The
+        # pipeline marks each request SUBMITTING immediately before its
+        # backend call and only records SUBMITTED after backend confirmation.
+        submissions = [
+            {
+                "requestType": req.request_type,
+                "structuredPayload": dict(req.details),
+            }
+            for req in targets
+        ]
 
         self.state.confirmation_pending = False
         self.state.confirmation_target = ConfirmationTarget.NONE
         self.state.confirmation_target_request_type = None
+        self.state.awaiting_field = None
 
         return ControllerDecision(
             action="submit",
@@ -243,10 +374,36 @@ class ConversationController:
         if request_type is not None:
             cancelled = self.state.cancel_request(request_type=request_type, turn_id=new_turn_id())
             if cancelled:
+                # A cancelled request invalidates any confirmation that covered
+                # it. Other ready requests stay independent and are re-read back
+                # so the caller can confirm them on their own.
+                self.state.confirmation_pending = False
+                self.state.confirmation_target = ConfirmationTarget.NONE
+                self.state.confirmation_target_request_type = None
+                self.state.awaiting_field = None
+                remaining = [
+                    req
+                    for req in self.state.captured_requests
+                    if req.is_active and req.status == RequestStatus.READY_FOR_CONFIRMATION
+                ]
+                if remaining:
+                    self.state.confirmation_pending = True
+                    self.state.confirmation_target = ConfirmationTarget.REQUEST
+                    self.state.confirmation_target_request_type = (
+                        remaining[0].request_type if len(remaining) == 1 else None
+                    )
+                    return ControllerDecision(
+                        action="confirm",
+                        response_text=(
+                            f"I've cancelled your {request_type.replace('-', ' ')} request. "
+                            f"{self._read_back_prompt()}"
+                        ),
+                        request_type=request_type,
+                    )
                 return ControllerDecision(
                     action="cancel",
                     response_text=(
-                        f"I've cancelled your {request_type} request. "
+                        f"I've cancelled your {request_type.replace('-', ' ')} request. "
                         "Is there anything else I can help with?"
                     ),
                     request_type=request_type,
@@ -286,7 +443,15 @@ class ConversationController:
         req_type = request_type or "unknown"
         self.state.backend_errors.append(error or "rejected by backend")
         for i, req in enumerate(self.state.captured_requests):
-            if (req.request_type == req_type or req_type == "unknown") and req.is_active:
+            matches = req.request_type == req_type or req_type == "unknown"
+            # SUBMITTING is no longer `is_active`; it must still be failed so a
+            # rejected backend call can never leave a request stuck forever.
+            if matches and req.status in (
+                RequestStatus.NEW,
+                RequestStatus.COLLECTING_INFORMATION,
+                RequestStatus.READY_FOR_CONFIRMATION,
+                RequestStatus.SUBMITTING,
+            ):
                 self.state.captured_requests[i] = req.mark_failed(
                     turn_id=new_turn_id(), reason=error or "rejected by backend"
                 )
@@ -305,12 +470,16 @@ class ConversationController:
         """Mark a request as submitted after backend confirmation."""
 
         turn_id = new_turn_id()
+        marked = False
         for i, req in enumerate(self.state.captured_requests):
             if req.request_type == request_type and req.status is RequestStatus.SUBMITTING:
                 self.state.captured_requests[i] = req.mark_submitted(
                     turn_id=turn_id, idempotency_key=idempotency_key
                 )
-        self.state.confirmed_submissions.append(request_type)
+                marked = True
+        # Record one logical confirmation per backend-confirmed submission.
+        if marked:
+            self.state.confirmed_submissions.append(request_type)
         return ControllerDecision(
             action="submit",
             response_text=(
@@ -351,12 +520,165 @@ class ConversationController:
         self.state.confirmation_target = ConfirmationTarget.NONE
         self.state.confirmation_target_request_type = None
 
+    # --- deterministic slot filling ----------------------------------------
+
+    def extract_awaited_slot(self, text: str) -> InterpretationResult | None:
+        """Fill the awaited slot from a short, explicit caller value.
+
+        This is a reliability backstop, not a replacement for the LLM: real
+        models occasionally return an empty `requests` list for a bare answer
+        such as "Wednesday". When exactly one request is active, the awaited
+        field is a date/time slot, and the utterance is a short explicit value,
+        the controller can fill it deterministically without guessing.
+
+        It never runs while a confirmation is pending (a bare value there is a
+        correction, handled by the normal interpretation path) and never treats
+        an administrative keyword or a yes/no as a slot value.
+        """
+        field = self.state.awaiting_field
+        if not field or self.state.confirmation_pending:
+            return None
+        active = [request for request in self.state.captured_requests if request.is_active]
+        if not active:
+            return None
+        candidates = [request for request in active if field in request.missing_fields]
+        if len(candidates) == 1:
+            request = candidates[0]
+        elif len(active) == 1:
+            request = active[0]
+        else:
+            # Several requests are waiting for different slots — let the model
+            # resolve the reference rather than guessing which one to fill.
+            return None
+        lowered = text.strip().lower()
+        if not lowered or len(lowered.split()) > 6:
+            return None
+        if self.infer_request_type_from_text(lowered) is not None:
+            return None
+        if _CANCEL_RE.search(lowered) or _REJECT_RE.search(lowered):
+            return None
+
+        if field == "preferred_date":
+            value = _extract_date_value(lowered)
+        elif field == "preferred_time":
+            value = _extract_time_value(lowered)
+        else:
+            return None
+        if value is None:
+            return None
+        return InterpretationResult(
+            intent=request.request_type,
+            requests=[
+                RequestDetail(
+                    request_type=request.request_type,
+                    details={field: value},
+                    missing_fields=[],
+                    source_quotes=[text.strip()],
+                )
+            ],
+        )
+
+    # --- deterministic confirmation classification -------------------------
+
+    @staticmethod
+    def classify_confirmation_act(text: str) -> str:
+        """Classify a caller reply to a confirmation prompt.
+
+        Returns one of: ``confirm``, ``reject``, ``cancel``, ``ambiguous``,
+        ``other``. This is deliberately lexical and deterministic: the model
+        is never the authority for submitting an administrative action.
+        """
+        lowered = text.strip().lower()
+        if not lowered:
+            return "other"
+        # Cancellation wins over a bare "no" ("No, cancel that request").
+        if _CANCEL_RE.search(lowered):
+            return "cancel"
+        if _AMBIGUOUS_RE.search(lowered):
+            return "ambiguous"
+        if _REJECT_RE.search(lowered):
+            return "reject"
+        if _CONFIRM_RE.search(lowered):
+            return "confirm"
+        return "other"
+
+    def interpretation_changes_state(self, result: InterpretationResult) -> bool:
+        """True when an interpretation supplies a new or corrected admin value.
+
+        Used while a confirmation is pending: a correction must invalidate the
+        old confirmation and trigger a fresh read-back, while a bare "yes" must
+        not be mistaken for a correction.
+        """
+        for request in result.requests:
+            if request.request_type not in ADMIN_REQUEST_TYPES:
+                continue
+            existing = self.state.get_active_request(request.request_type)
+            if existing is None:
+                return True
+            details = _sanitize_details(dict(request.details))
+            for field, value in details.items():
+                if value is not None and existing.details.get(field) != value:
+                    return True
+            for field in existing.missing_fields:
+                if details.get(field) is not None:
+                    return True
+        return False
+
+    @staticmethod
+    def infer_request_type_from_text(text: str) -> str | None:
+        """Infer which administrative request a short reply refers to.
+
+        Used only to target a cancellation ("cancel the prescription") when
+        more than one request is pending. It never submits anything and never
+        overrides an explicit confirmation.
+        """
+        lowered = text.strip().lower()
+        if "prescription" in lowered or "medication" in lowered:
+            return "prescription-request"
+        if any(word in lowered for word in ("reschedule", "move", "change")):
+            return "appointment-change-request"
+        if any(word in lowered for word in ("appointment", "book", "booking", "schedule")):
+            return "appointment-request"
+        if "administration" in lowered or "admin" in lowered:
+            return "practice-administration"
+        return None
+
+    @staticmethod
+    def is_practice_information(result: InterpretationResult) -> bool:
+        """True when the interpretation is a practice-information inquiry."""
+        if result.intent == "practice-information":
+            return True
+        return any(req.request_type == "practice-information" for req in result.requests)
+
+    @staticmethod
+    def has_admin_request(result: InterpretationResult) -> bool:
+        return any(req.request_type in ADMIN_REQUEST_TYPES for req in result.requests)
+
+    def _details_fingerprint(self) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+        return tuple(
+            (
+                req.request_type,
+                tuple(sorted((k, v) for k, v in req.details.items() if v is not None)),
+            )
+            for req in self.state.captured_requests
+            if req.is_active
+        )
+
     def _collect_missing(self) -> list[str]:
         return self.state.collect_missing()
 
     def _ask_clarification(self, result: InterpretationResult) -> ControllerDecision:
         self.state.clarification_count += 1
         reason = result.clarification_reason or "I'm not sure I understood."
+        lowered = reason.lower()
+        if "greeting" in lowered or lowered.startswith(("caller", "user", "the caller", "the user")):
+            return ControllerDecision(
+                action="clarify",
+                response_text=(
+                    "Hello! How can I help you today? You can ask to book an appointment, "
+                    "request a prescription, or ask about our practice services."
+                ),
+            )
         if self.state.clarification_count > self.state.MAX_CLARIFICATIONS:
             return ControllerDecision(
                 action="clarify",
@@ -375,17 +697,25 @@ class ConversationController:
             "preferred_date": "What date would you like?",
             "preferred_time": "What time of day would you prefer?",
             "reason_for_appointment": "What is the reason for your appointment?",
+            "reason_as_stated": "What is the reason for your request?",
         }
-        return prompts.get(field, f"Could you tell me your {field}?")
+        return prompts.get(field, f"Could you tell me your {field.replace('_', ' ')}?")
 
     def _read_back_prompt(self) -> str:
         parts: list[str] = []
         for req in self.state.captured_requests:
             if not req.is_active:
                 continue
-            detail_str = ", ".join(f"{k}: {v}" for k, v in req.details.items() if v is not None)
-            parts.append(f"{req.request_type}: {detail_str}")
+            detail_str = ", ".join(
+                f"{k.replace('_', ' ')}: {v}" for k, v in req.details.items() if v is not None
+            )
+            parts.append(f"{req.request_type.replace('-', ' ')}: {detail_str}")
         joined = "; ".join(parts)
+        if len(parts) > 1:
+            return (
+                f"Before I submit, please confirm these separate requests: {joined}. "
+                "Is that correct? Please say yes or no."
+            )
         return f"Before I submit, please confirm: {joined}. Is that correct? Please say yes or no."
 
 

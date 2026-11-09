@@ -94,6 +94,10 @@ class AzureSpeechToTextProvider:
         self._session_id: str | None = None
         self._started = False
         self._stopped = False
+        # `_closing` is true during graceful teardown: callbacks may still emit
+        # a flushed final transcript until the stream is fully closed.
+        self._closing = False
+        self._end_of_stream = False
         self._sequence = 0
         self._mk_lock = threading.Lock()  # guards `_sequence` (SDK-thread callbacks)
         self._sdk = None  # azure.cognitiveservices.speech (lazy)
@@ -139,6 +143,21 @@ class AzureSpeechToTextProvider:
     async def stop(self, session_id: str, *, reason: str = "session_stop") -> None:
         if self._session_id != session_id or self._stopped:
             return
+        # Close the push stream BEFORE stopping continuous recognition: the SDK
+        # flushes any pending final result when it sees end-of-stream. Stopping
+        # the recognizer first drops that final (verified live).
+        self._closing = True
+        stream = self._push_stream
+        if stream is not None:
+            try:
+                await asyncio.to_thread(stream.close)
+            except Exception as exc:  # noqa: BLE001 — best-effort close
+                logger.warning(
+                    "azure STT push-stream close failed",
+                    extra={"session_id": session_id, "detail": str(exc)},
+                )
+            # Allow the SDK thread to deliver the flushed final transcript.
+            await asyncio.sleep(min(0.75, max(0.05, self._stop_timeout)))
         self._stopped = True
         if self._started and self._recognizer is not None:
             try:
@@ -186,12 +205,16 @@ class AzureSpeechToTextProvider:
             channels=1,
         )
         self._push_stream = audio_cls.PushAudioInputStream(stream_format=stream_format)
+        # The SDK requires an AudioConfig wrapper around the stream. Passing the
+        # PushAudioInputStream directly is accepted by the constructor but the
+        # recognizer never receives audio (verified live: 0 partials, 0 finals).
+        audio_config = audio_cls.AudioConfig(stream=self._push_stream)
 
         speech_config = sdk.SpeechConfig(subscription=self._speech_key, region=self._speech_region)
         speech_config.speech_recognition_language = self._language
 
         self._recognizer = sdk.SpeechRecognizer(
-            speech_config=speech_config, audio_config=self._push_stream
+            speech_config=speech_config, audio_config=audio_config
         )
         self._recognizer.recognizing.connect(self._on_recognizing)
         self._recognizer.recognized.connect(self._on_recognized)
@@ -252,6 +275,17 @@ class AzureSpeechToTextProvider:
         if self._stopped:
             return
         details = getattr(event_args.result, "cancellation_details", None)
+        reason_value = getattr(details, "reason", None)
+        sdk = self._sdk
+        end_of_stream = sdk is not None and reason_value == getattr(
+            sdk.CancellationReason, "EndOfStream", None
+        )
+        if end_of_stream:
+            # Closing the push stream during graceful teardown produces
+            # EndOfStream. It is normal, not a provider failure: stop() still
+            # emits RecognitionStopped after the final flush window.
+            self._end_of_stream = True
+            return
         message = str(getattr(details, "error_details", "") or "recognition canceled")
         self._stopped = True  # provider closed the stream; no further events make sense
         self._emit_soon(
@@ -263,7 +297,11 @@ class AzureSpeechToTextProvider:
                 fatal=True,
             )
         )
-        self._queue.put_nowait(_STREAM_END)
+        # Enqueue the sentinel on the same loop turn as the error so the error
+        # cannot be lost behind an immediately-available sentinel.
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._queue.put_nowait, _STREAM_END)
 
     def _metadata_of(self, event_args: Any) -> dict[str, Any]:
         result = event_args.result

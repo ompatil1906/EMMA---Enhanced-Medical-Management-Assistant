@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
+from app.api.routes.livekit_token import router as livekit_token_router
 from app.api.routes.websocket import router as websocket_router
 from app.core.config import get_settings
 from app.core.lifecycle import GatewayState
@@ -63,8 +64,9 @@ def create_app() -> FastAPI:
                 "app_env": settings.APP_ENV,
                 "provider_mode": settings.EXOTEL_MODE,
                 "voice_pipeline": settings.VOICE_PIPELINE,
-                "stt_provider": "mock",
-                "tts_provider": "mock",
+                "stt_provider": str(settings.STT_PROVIDER),
+                "tts_provider": str(settings.TTS_PROVIDER),
+                "llm_provider": str(settings.LLM_PROVIDER),
                 "practice_api": bool(settings.PRACTICE_API_BASE_URL),
                 "speech_ready": state.speech_factory is not None and speech_problem is None,
                 "embedding_provider": settings.EMBEDDING_PROVIDER,
@@ -108,6 +110,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(websocket_router)
+    app.include_router(livekit_token_router)
     return app
 
 

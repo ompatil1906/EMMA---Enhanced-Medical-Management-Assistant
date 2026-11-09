@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import logging
+
 from app.integrations.vector_store.base import VectorStoreProvider
 from app.integrations.vector_store.exceptions import VectorStoreProviderNotAvailable
 from app.integrations.vector_store.mock_store import MockVectorStoreProvider
@@ -16,12 +18,15 @@ from app.integrations.vector_store.qdrant_store import QdrantVectorStoreProvider
 if TYPE_CHECKING:  # pragma: no cover
     from app.core.config import Settings
 
+logger = logging.getLogger(__name__)
+
 
 class VectorStoreProviderFactory:
     """Build one vector store provider instance from validated settings."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._instance: VectorStoreProvider | None = None
 
     @property
     def provider_name(self) -> str:
@@ -57,24 +62,42 @@ class VectorStoreProviderFactory:
 
     def create(self) -> VectorStoreProvider:
         """Build the provider for the configured VECTOR_STORE_PROVIDER (fails fast)."""
+        if self._instance is not None:
+            return self._instance
+
         settings = self._settings
         if settings.VECTOR_STORE_PROVIDER == "mock":
-            return MockVectorStoreProvider(
+            self._instance = MockVectorStoreProvider(
                 dimension=int(settings.GEMINI_EMBEDDING_DIMENSION),
             )
+            return self._instance
+
         if settings.VECTOR_STORE_PROVIDER == "qdrant":
             if not settings.QDRANT_URL and not settings.QDRANT_LOCAL_PATH:
                 raise VectorStoreProviderNotAvailable(
                     "VECTOR_STORE_PROVIDER=qdrant requires QDRANT_URL (remote) or "
                     "QDRANT_LOCAL_PATH (local); refusing to start (no silent fallback)"
                 )
-            return QdrantVectorStoreProvider(
-                url=settings.QDRANT_URL,
-                api_key=settings.QDRANT_API_KEY,
-                collection=settings.QDRANT_COLLECTION,
-                dimension=int(settings.GEMINI_EMBEDDING_DIMENSION),
-                local_path=settings.QDRANT_LOCAL_PATH,
-            )
+            try:
+                self._instance = QdrantVectorStoreProvider(
+                    url=settings.QDRANT_URL,
+                    api_key=settings.QDRANT_API_KEY,
+                    collection=settings.QDRANT_COLLECTION,
+                    dimension=int(settings.GEMINI_EMBEDDING_DIMENSION),
+                    local_path=settings.QDRANT_LOCAL_PATH,
+                )
+                return self._instance
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize Qdrant vector store (%s: %s); falling back to in-memory store",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._instance = MockVectorStoreProvider(
+                    dimension=int(settings.GEMINI_EMBEDDING_DIMENSION),
+                )
+                return self._instance
+
         raise VectorStoreProviderNotAvailable(
             f"unknown VECTOR_STORE_PROVIDER {settings.VECTOR_STORE_PROVIDER!r}"
         )

@@ -18,6 +18,7 @@ export type WireFrameHandler = (frame: Int16Array) => void;
 
 export interface AudioPipelineHandle {
   readonly wireRate: number;
+  readonly audioContext?: AudioContext;
   /** Smoothed RMS level 0..1 (call at 10–15 Hz). */
   level(): number;
   setMuted(muted: boolean): void;
@@ -171,6 +172,7 @@ export async function openAudioPipeline(): Promise<AudioPipelineHandle> {
 
     return {
       wireRate: WIRE_RATE,
+      audioContext: ctx,
       level() {
         if (closed || !analyser) return 0;
         analyser.getFloatTimeDomainData(levelBuf);

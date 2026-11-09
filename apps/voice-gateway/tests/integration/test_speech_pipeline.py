@@ -24,11 +24,19 @@ TEST_STREAM_SID = "stream-test-001"
 
 SPEECH_MODE_PARAMS: dict[str, str] = {
     "VOICE_PIPELINE": "speech",
+    # Tests must be deterministic regardless of the developer's `.env`.
+    # The repository `.env` may select real Azure speech providers; these
+    # tests explicitly pin the mock providers (no silent fallback in the app
+    # itself — this is test configuration only).
+    "STT_PROVIDER": "mock",
+    "TTS_PROVIDER": "mock",
     "MOCK_STT_FINALIZE_MS": "30",
     "MOCK_STT_UTTERANCE_MS": "1200",
     "MOCK_STT_ERROR_AT_FRAME": "0",
     "PRACTICE_API_BASE_URL": "",
     "LLM_PROVIDER": "mock",
+    "EMBEDDING_PROVIDER": "mock",
+    "VECTOR_STORE_PROVIDER": "mock",
 }
 
 USER_UTTERANCE = "I would like to book an appointment"
@@ -125,6 +133,34 @@ async def test_speech_mode_emergency_guard_bypasses_llm(
         assert (code, reason) == (1000, "stop")
 
     await poll_active_sessions(server_url["http"], expected=0)
+
+
+@pytest.mark.parametrize("server_url", [SPEECH_MODE_PARAMS], indirect=True)
+async def test_speech_mode_control_events_opt_in(server_url: dict[str, str]) -> None:
+    """`?control-events=1` adds UI messages without changing media envelopes."""
+    ws_url = f"{server_url['ws']}?sample-rate=8000&control-events=1"
+    async with connect(ws_url) as ws:
+        await open_stream(ws)
+        seen: list[dict[str, object]] = []
+        media_bytes = 0
+        for _ in range(30):
+            reply = await receive_json(ws, timeout=10.0)
+            seen.append(reply)
+            if reply["event"] == "media":
+                media_bytes += len(base64.b64decode(reply["media"]["payload"]))
+            if any(r["event"] == "assistant" for r in seen) and media_bytes >= 3200:
+                break
+
+        assert any(
+            r["event"] == "assistant" and isinstance(r.get("text"), str) and r["text"] for r in seen
+        ), f"no assistant control event in {seen!r}"
+        assert any(r["event"] == "state" and r.get("state") == "speaking" for r in seen), (
+            f"no speaking state in {seen!r}"
+        )
+        assert media_bytes >= 3200, "greeting audio missing"
+
+        code, reason = await _send_stop_and_expect_clean_close(ws)
+        assert (code, reason) == (1000, "stop")
 
 
 @pytest.mark.parametrize("server_url", [SPEECH_MODE_PARAMS], indirect=True)

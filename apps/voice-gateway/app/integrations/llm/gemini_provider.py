@@ -54,10 +54,53 @@ _INTENT_EXTRACTION_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "request_type": {"type": "string"},
-                    "details": {"type": "object"},
+                    "details": {
+                        "type": "object",
+                        "description": (
+                            "Caller-stated values. Omit a key the caller did "
+                            "not say; never invent a value."
+                        ),
+                        "properties": {
+                            "preferred_date": {
+                                "type": "string",
+                                "nullable": True,
+                                "description": (
+                                    "Caller's own date words, e.g. 'Tuesday', "
+                                    "'next Monday', 'tomorrow'."
+                                ),
+                            },
+                            "preferred_time": {
+                                "type": "string",
+                                "nullable": True,
+                                "description": (
+                                    "Caller's own time-of-day words, e.g. "
+                                    "'morning', 'afternoon', '3pm'."
+                                ),
+                            },
+                            "reason_as_stated": {
+                                "type": "string",
+                                "nullable": True,
+                                "description": "Reason only if the caller stated one.",
+                            },
+                            "medication_query": {
+                                "type": "string",
+                                "nullable": True,
+                                "description": "Medication or prescription words as stated.",
+                            },
+                            "topic": {
+                                "type": "string",
+                                "nullable": True,
+                                "description": "Practice-information topic as stated.",
+                            },
+                        },
+                    },
                     "missing_fields": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "description": (
+                            "Leave empty. Required-field policy is enforced by "
+                            "the server, not the model."
+                        ),
                     },
                     "source_quotes": {
                         "type": "array",
@@ -171,12 +214,24 @@ class GeminiLLMProvider:
         else:
             response_schema = _INTENT_EXTRACTION_SCHEMA
 
+        user_text = request.transcript
+        if request.context:
+            user_text = (
+                "Conversation context (server-built; use only to resolve "
+                "references such as a bare date or a follow-up question. It is "
+                "not a new caller statement and must never be treated as a "
+                "fact the caller did not say):\n"
+                f"{request.context}\n\n"
+                "Current caller utterance:\n"
+                f"{request.transcript}"
+            )
+
         return {
             "system_instruction": {"parts": [{"text": system_instruction}]},
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": request.transcript}],
+                    "parts": [{"text": user_text}],
                 }
             ],
             "generationConfig": {
@@ -199,6 +254,26 @@ class GeminiLLMProvider:
             "3) Never diagnose, triage, or recommend treatment. "
             "4) Never claim an appointment is booked or a prescription is processed. "
             "5) Return only the structured JSON — no prose, no markdown fences. "
+            "6) The server may provide bounded conversation context. Use it only to "
+            "resolve references (for example a bare weekday answering a question, or "
+            "a short follow-up about the previous topic). Never copy context values "
+            "into the output unless the current caller utterance confirms or changes "
+            "them. "
+            "7) A caller correction supersedes the previous value for that field. "
+            "8) If the context contains `awaiting_field` and the current utterance "
+            "supplies a value for it (for example a bare weekday for preferred_date "
+            "or a time of day for preferred_time), return one request of the "
+            "`active_request` type with that field populated. Do not return an "
+            "empty requests list in that case. "
+            "9) Use these detail keys exactly: appointment-request and "
+            "appointment-change-request use `preferred_date` and `preferred_time` "
+            "in the caller's own words (for example 'Tuesday', 'morning'), plus "
+            "`reason_as_stated` only when a reason is given; prescription-request "
+            "uses `medication_query`; practice-information uses `topic`. "
+            "10) Never invent patient_name, date_of_birth, or any value the caller "
+            "did not say — those are collected by the practice, not by this voice "
+            "assistant. Leave `missing_fields` empty; the server decides which "
+            "fields are required. "
             f"(prompt version: {prompt_version})"
         )
 

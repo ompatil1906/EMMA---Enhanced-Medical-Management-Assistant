@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { PhoneCall, User, Phone, Sparkles, ShieldCheck, CalendarCheck } from "lucide-react";
+import { PhoneCall, User, Phone, ShieldCheck, CalendarCheck } from "lucide-react";
 
 export interface IntakeFormData {
   firstName: string;

@@ -50,23 +50,23 @@ _URGENT_DEMO_KEYWORDS = (
 
 _TEST_PHRASES = ("test response", "pipeline test")
 
-_GREETING = "Hello, this is the practice's automated assistant. How can I help you today?"
+_GREETING = "Hello, I am EMMA, your medical practice receptionist from QuantumLoopAI. How can I assist you today?"
 _CLARIFICATION = (
-    "Sorry, I didn't catch that. You can ask about booking, cancelling or "
-    "moving an appointment, or about prescriptions."
+    "I'm sorry, I didn't quite catch that. You can ask me to book or reschedule an appointment, "
+    "request a prescription refill, or ask about our clinic hours."
 )
 _TEST_RESPONSE = (
-    "This is the EMMA voice pipeline test response. Speech, state and audio "
-    "formatting are all live."
+    "This is EMMA, your Medical Management Assistant pipeline test response. "
+    "Audio and speech pipelines are fully operational."
 )
-_HANDOFF_RESPONSE = "Understood — I'll pass you to the practice team now. Please hold."
+_HANDOFF_RESPONSE = "Understood — transferring you to a clinic team member now. Please hold."
 _BOOKING_RESPONSE = (
-    "Sure — a member of the practice team will follow up on your appointment request."
+    "Thank you. Your appointment request has been scheduled with our reception team."
 )
-_RESCHEDULE_RESPONSE = "OK — the practice team will follow up about moving your appointment."
-_CANCEL_RESPONSE = "OK — a member of the practice team will follow up to confirm that cancellation."
+_RESCHEDULE_RESPONSE = "Thank you. Our clinic team will process your appointment reschedule."
+_CANCEL_RESPONSE = "Understood. Your cancellation request has been logged."
 _PRESCRIPTION_RESPONSE = (
-    "OK — a member of the practice team will follow up about your medication query."
+    "Thank you. Your prescription refill request has been sent to our medical team."
 )
 
 

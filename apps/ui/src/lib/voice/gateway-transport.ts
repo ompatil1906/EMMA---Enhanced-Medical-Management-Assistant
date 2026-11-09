@@ -1,21 +1,28 @@
 "use client";
 
 /* Live transport — the browser plays the provider role against the real
-   EMMA voice gateway (`/ws/exotel`, simulation mode):
+   EMMA voice gateway (`/ws/exotel`, speech pipeline):
 
      connect → connected → start{media_format} → media{chunk} every 20 ms
-     → echoed media{payload} replies (counted + RTT-measured) → stop → close 1000
+     → Azure STT / Gemini / controller / Azure TTS
+     → control events (transcript/assistant/state/barge-in) + media{payload}
+     → PCM playback → stop → close 1000
 
-   Honesty rules (echo gateway, no AI behind it yet):
-   * it never emits thinking/speaking states or agent text;
-   * the UI speaks of "echo verified", never of agent speech;
-   * transcripts come only from the browser's own speech engine, if present,
-     so every transcript line is genuinely what the user said.
+   The gateway only emits control events when the connection opts in with
+   `?control-events=1`; the verified Exotel `media` envelope is unchanged.
+
+   Barge-in has two layers:
+   * server: the gateway cancels TTS when genuine caller energy arrives while
+     speaking (energy-gated, so a continuously streaming mic cannot interrupt
+     every reply);
+   * browser: this transport stops local playback and sends `barge-in` as soon
+     as the mic level indicates the caller is talking over the assistant.
 
    Browser limitation: WebSocket custom headers are impossible, so this works
    against a gateway without WS_AUTH_TOKEN (the default local configuration). */
 
 import type {
+  TranscriptKind,
   VoiceEvent,
   VoiceMetrics,
   VoiceSessionContext,
@@ -23,9 +30,12 @@ import type {
   VoiceTransport,
 } from "@/lib/voice/types";
 import type { AudioPipelineHandle } from "@/lib/voice/audio-pipeline";
-import { createTranscriber, type TranscriberHandle } from "@/lib/voice/speech";
+import { createPcmPlayer, type PcmPlayerHandle } from "@/lib/voice/pcm-player";
 
 const FRAME_MS = 20;
+const SAMPLE_RATE = 16_000;
+const BARGE_IN_LEVEL = 0.40;
+const BARGE_IN_TICKS = 4;
 
 const CLOSE_REASONS: Record<number, string> = {
   1003: "Protocol error — the gateway rejected our frames",
@@ -33,6 +43,12 @@ const CLOSE_REASONS: Record<number, string> = {
   1009: "A message exceeded the gateway size limit",
   1011: "Gateway internal error",
   1013: "Gateway session limit reached",
+};
+
+const GATEWAY_STATES: Record<string, VoiceState> = {
+  listening: "listening",
+  thinking: "thinking",
+  speaking: "speaking",
 };
 
 function int16ToBase64(frame: Int16Array): string {
@@ -53,6 +69,14 @@ function randomId(prefix: string): string {
   return `${prefix}-${uuid}`;
 }
 
+interface GatewayMessage {
+  event?: string;
+  media?: { payload?: string };
+  kind?: string;
+  text?: string;
+  state?: string;
+}
+
 export interface GatewayTransportOptions {
   /** WebSocket endpoint, e.g. ws://localhost:8000/ws/exotel (no query params). */
   url: string;
@@ -65,17 +89,14 @@ export function createGatewayTransport(
   const { url, pipeline } = options;
 
   let ws: WebSocket | null = null;
+  let player: PcmPlayerHandle | null = null;
   let active = false;
   let closing = false;
   let framesSent = 0;
   let framesReceived = 0;
-  let rttSum = 0;
-  let rttCount = 0;
-  /** FIFO of perf.now()-style timestamps, one per in-flight echo. */
-  const sentAt: number[] = [];
+  let monitorTimer: number | null = null;
+  let speechTicks = 0;
   let unsubscribeFrames: (() => void) | null = null;
-  let offMute: (() => void) | null = null;
-  let transcriber: TranscriberHandle | null = null;
   let ctx: VoiceSessionContext | null = null;
 
   const emit = (event: VoiceEvent) => ctx?.onEvent(event);
@@ -88,19 +109,55 @@ export function createGatewayTransport(
     const metrics: VoiceMetrics = {
       framesIn: framesSent,
       framesOut: framesReceived,
-      rttMsAvg: rttCount > 0 ? Math.round(rttSum / rttCount) : null,
+      rttMsAvg: null,
       closeCode,
     };
     emit({ type: "metrics", metrics });
   };
 
+  const stopMonitor = () => {
+    if (monitorTimer !== null) {
+      window.clearInterval(monitorTimer);
+      monitorTimer = null;
+    }
+    speechTicks = 0;
+  };
+
+  const startMonitor = (socket: WebSocket) => {
+    stopMonitor();
+    monitorTimer = window.setInterval(() => {
+      if (!active) return;
+      const currentPlayer = player;
+      if (currentPlayer === null) return;
+      emit({ type: "output-level", level: currentPlayer.level() });
+
+      if (!currentPlayer.isPlaying()) {
+        speechTicks = 0;
+        return;
+      }
+      if (pipeline.level() >= BARGE_IN_LEVEL) {
+        speechTicks += 1;
+        if (speechTicks >= BARGE_IN_TICKS) {
+          speechTicks = 0;
+          currentPlayer.stop();
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ event: "barge-in" }));
+          }
+        }
+      } else {
+        speechTicks = 0;
+      }
+    }, 60);
+  };
+
   const cleanupAudio = () => {
+    stopMonitor();
     unsubscribeFrames?.();
     unsubscribeFrames = null;
-    offMute?.();
-    offMute = null;
-    transcriber?.stop();
-    transcriber = null;
+    const currentPlayer = player;
+    player = null;
+    void currentPlayer?.close();
+    emit({ type: "output-level", level: 0 });
   };
 
   const start = (session: VoiceSessionContext) => {
@@ -108,14 +165,18 @@ export function createGatewayTransport(
     if (active) return;
     active = true;
     closing = false;
+    speechTicks = 0;
+    player = createPcmPlayer({
+      sampleRate: SAMPLE_RATE,
+      audioContext: pipeline.audioContext,
+    });
 
-    const urlWithRate = url.includes("?")
-      ? `${url}&sample-rate=16000`
-      : `${url}?sample-rate=16000`;
+    const separator = url.includes("?") ? "&" : "?";
+    const urlWithOptions = `${url}${separator}sample-rate=${SAMPLE_RATE}&control-events=1`;
 
     let socket: WebSocket;
     try {
-      socket = new WebSocket(urlWithRate);
+      socket = new WebSocket(urlWithOptions);
     } catch {
       active = false;
       emit({ type: "error", message: "Invalid gateway URL — check configuration" });
@@ -144,7 +205,7 @@ export function createGatewayTransport(
           call_sid: randomId("ui-call"),
           media_format: {
             encoding: "PCM",
-            sample_rate: 16000,
+            sample_rate: SAMPLE_RATE,
             bit_rate: 256000,
           },
         }),
@@ -157,52 +218,69 @@ export function createGatewayTransport(
         const chunk = int16ToBase64(frame);
         const timestamp = String(framesSent * FRAME_MS);
         framesSent += 1;
-        sentAt.push(performance.now());
-        socket.send(
-          JSON.stringify({ event: "media", chunk, timestamp }),
-        );
+        socket.send(JSON.stringify({ event: "media", chunk, timestamp }));
       });
 
-      offMute = pipeline.onMuteChange((muted) => {
-        if (muted) {
-          transcriber?.stop();
-          transcriber = null;
-        } else if (transcriber === null && active) {
-          transcriber = createTranscriber(onTranscript);
-        }
-      });
-
-      // Best-effort transcription of the user's own speech (browser engine).
-      transcriber = createTranscriber(onTranscript);
-      if (transcriber === null) {
-        emit({
-          type: "notice",
-          line: {
-            id: randomId("notice"),
-            text: "Live transcription is not available in this browser — audio is still streaming and echoed",
-            sample: false,
-          },
-        });
-      }
+      startMonitor(socket);
     };
 
     socket.onmessage = (raw) => {
       if (!active) return;
-      let reply: unknown;
+      let reply: GatewayMessage;
       try {
-        reply = JSON.parse(String(raw.data)) as unknown;
+        reply = JSON.parse(String(raw.data)) as GatewayMessage;
       } catch {
         return;
       }
-      const media = reply as { event?: string; media?: { payload?: string } };
-      if (media.event === "media" && media.media?.payload) {
-        framesReceived += 1;
-        const startAt = sentAt.shift();
-        if (startAt !== undefined) {
-          rttSum += performance.now() - startAt;
-          rttCount += 1;
+
+      switch (reply.event) {
+        case "media": {
+          const payload = reply.media?.payload;
+          if (!payload) return;
+          framesReceived += 1;
+          player?.playBase64(payload);
+          if (framesReceived % 25 === 0) emitMetrics(null);
+          return;
         }
-        if (framesReceived % 25 === 0) emitMetrics(null);
+        case "transcript": {
+          if (typeof reply.text !== "string" || !reply.text.trim()) return;
+          const kind: TranscriptKind =
+            reply.kind === "partial" ? "partial" : "final";
+          emit({
+            type: "transcript",
+            line: {
+              id: randomId("t"),
+              kind,
+              text: reply.text,
+              sample: false,
+            },
+          });
+          return;
+        }
+        case "assistant": {
+          if (typeof reply.text !== "string" || !reply.text.trim()) return;
+          emit({
+            type: "transcript",
+            line: {
+              id: randomId("a"),
+              kind: "agent",
+              text: reply.text,
+              sample: false,
+            },
+          });
+          return;
+        }
+        case "state": {
+          const mapped = reply.state ? GATEWAY_STATES[reply.state] : undefined;
+          if (mapped) setState(mapped);
+          return;
+        }
+        case "barge-in": {
+          player?.stop();
+          return;
+        }
+        default:
+          return;
       }
     };
 
@@ -224,7 +302,7 @@ export function createGatewayTransport(
           type: "notice",
           line: {
             id: randomId("notice"),
-            text: `Stream ended — ${framesSent} frames echoed, closed cleanly (1000)`,
+            text: `Stream ended — ${framesReceived} assistant audio frames, closed cleanly (1000)`,
             sample: false,
           },
         });
@@ -243,19 +321,6 @@ export function createGatewayTransport(
     };
   };
 
-  const onTranscript = (text: string, final: boolean) => {
-    if (!active) return;
-    emit({
-      type: "transcript",
-      line: {
-        id: randomId("t"),
-        kind: final ? "final" : "partial",
-        text,
-        sample: false,
-      },
-    });
-  };
-
   const stop = () => {
     if (!active) {
       // Never opened / already gone: just make sure the UI unblocks.
@@ -263,7 +328,6 @@ export function createGatewayTransport(
       return;
     }
     closing = true;
-    pipeline.setMuted(false);
     try {
       ws?.send(JSON.stringify({ event: "stop", reason: "stopped" }));
       ws?.close(1000, "client stopped");

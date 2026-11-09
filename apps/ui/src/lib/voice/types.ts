@@ -3,8 +3,13 @@
    Two transports implement the same interface:
 
    * `gateway-transport` — live: streams the browser mic to the real
-     `/ws/exotel` endpoint (provider role, simulation mode). Honest by design:
-     it never emits agent speech, thinking, or speaking states.
+     `/ws/exotel` speech pipeline (Azure STT → controller → Azure TTS) and
+     plays the returned PCM audio. It renders the gateway's own transcript,
+     assistant text, and state control events.
+   * `livekit-transport` — live: connects the browser mic to a LiveKit room
+     running a LiveKit agent (Deepgram Flux STT → OpenAI GPT-6 Luna →
+     controller → Qdrant RAG → NestJS backend → ElevenLabs TTS). Requires
+     `VOICE_TRANSPORT=livekit` and LiveKit credentials on the gateway.
    * `demo-transport` — a clearly-labelled visual preview that walks the
      listening → thinking → speaking cycle with SAMPLE dialogue. It never
      pretends a real call or an AI conversation took place. */
@@ -23,9 +28,9 @@ export type VoiceMode = "live" | "demo";
 export interface VoiceMetrics {
   /** media frames sent to the gateway */
   framesIn: number;
-  /** echoed frames received back */
+  /** assistant audio frames received from the gateway */
   framesOut: number;
-  /** rolling average send→echo round-trip, ms */
+  /** echo-mode round-trip average, ms; null for the speech pipeline */
   rttMsAvg: number | null;
   closeCode: number | null;
 }
@@ -51,7 +56,7 @@ export type VoiceEvent =
   | { type: "transcript"; line: TranscriptLine }
   | { type: "notice"; line: VoiceNoticeLine }
   | { type: "metrics"; metrics: VoiceMetrics }
-  | /** demo speech envelope, 0..1; live transports never emit this */
+  | /** output speech envelope, 0..1 (demo and live playback) */
     { type: "output-level"; level: number }
   | { type: "error"; message: string }
   | { type: "ended"; reason: "user" | "done" | "error" };

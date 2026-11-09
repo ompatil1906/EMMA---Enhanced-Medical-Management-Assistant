@@ -97,9 +97,13 @@ class AdministrativeRequest:
         missing_fields: list[str],
         source_quotes: list[str],
         turn_id: str,
-        status: RequestStatus = RequestStatus.COLLECTING_INFORMATION,
     ) -> AdministrativeRequest:
-        """Return a copy with merged details and corrected fields (latest wins)."""
+        """Return a copy with merged details and corrected fields (latest wins).
+
+        The lifecycle status is derived from the *merged* missing fields, not
+        from the latest utterance alone: filling one slot on a second turn must
+        move the request to READY when nothing else is missing.
+        """
         merged = dict(self.details)
         merged.update(details)
         missing = [f for f in missing_fields if f not in merged or merged[f] is None]
@@ -108,7 +112,11 @@ class AdministrativeRequest:
             details=merged,
             missing_fields=missing,
             source_quotes=list(dict.fromkeys(self.source_quotes + source_quotes)),
-            status=status,
+            status=(
+                RequestStatus.READY_FOR_CONFIRMATION
+                if not missing
+                else RequestStatus.COLLECTING_INFORMATION
+            ),
             turn_id=turn_id,
         )
 
@@ -121,6 +129,7 @@ class AdministrativeRequest:
             source_quotes=self.source_quotes,
             status=RequestStatus.SUBMITTED,
             turn_id=turn_id,
+            confirmed_at=time.time(),
             submitted_at=time.time(),
             idempotency_key=idempotency_key,
         )
@@ -265,11 +274,6 @@ class ConversationState:
                     missing_fields=request.missing_fields,
                     source_quotes=request.source_quotes,
                     turn_id=request.turn_id or "",
-                    status=(
-                        RequestStatus.READY_FOR_CONFIRMATION
-                        if not request.missing_fields
-                        else RequestStatus.COLLECTING_INFORMATION
-                    ),
                 )
                 self.captured_requests[i] = merged
                 return merged

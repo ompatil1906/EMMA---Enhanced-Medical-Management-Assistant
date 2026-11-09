@@ -13,6 +13,13 @@ dependencies = [
     "azure-cognitiveservices-speech>=1.53,<2.0",
     "httpx>=0.28,<1.0",
     "qdrant-client>=1.20.0",
+    # Day 18: the Deepgram streaming adapter needs websockets at RUNTIME (it was
+    # dev-only, so a production install could not have used Deepgram STT).
+    "websockets>=15,<16",
+    # Day 12/13: LiveKit WebRTC voice runtime (optional — lazy imports;
+    # only required when VOICE_TRANSPORT=livekit).
+    "livekit>=1.0,<2.0",
+    "livekit-agents>=0.17",
 ]
 
 [dependency-groups]
@@ -21,7 +28,6 @@ dev = [
     "pytest-asyncio>=1.0,<2.0",
     "httpx>=0.28,<1.0",
     "ruff>=0.12,<1.0",
-    "websockets>=15,<16",
 ]
 
 [build-system]
@@ -40,6 +46,9 @@ pythonpath = ["."]
 addopts = "-q"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: requires real provider credentials and network access (skipped unless EMMA_RUN_LIVE_TESTS=1)",
+]
 
 [tool.ruff]
 line-length = 100

@@ -45,6 +45,11 @@ class LLMRequest:
     # provider validates against this schema instead — validation failure
     # returns parsed=None rather than raising, letting the caller handle it.
     response_schema: type[Any] | None = None
+    # Bounded, server-built conversation context (Day 9). Used only to resolve
+    # references such as a bare "Wednesday" answering "what day?" or a
+    # follow-up question about a previous grounded topic. It is never treated
+    # as new caller statements and never contains model-generated facts.
+    context: str | None = None
 
 
 @dataclass(frozen=True)

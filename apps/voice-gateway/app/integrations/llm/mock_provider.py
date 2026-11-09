@@ -14,6 +14,7 @@ Determinism rules:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from app.domain.llm import InterpretationResult, RequestDetail
@@ -34,6 +35,90 @@ _EMERGENCY_HINT = (
     "stroke",
     "heart attack",
 )
+
+_DATE_WORDS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "today",
+    "tomorrow",
+    "next week",
+    "this week",
+)
+_TIME_WORDS = ("morning", "afternoon", "evening", "noon")
+
+
+def _extract_date(text: str) -> str | None:
+    """Extract an explicitly stated date phrase (never infer one).
+
+    When several dates appear ("change Wednesday to Thursday"), the last one
+    is the correction and wins.
+    """
+    lowered = text.lower()
+    matches: list[tuple[int, str]] = []
+    for word in _DATE_WORDS:
+        for match in re.finditer(rf"\b{re.escape(word)}\b", lowered):
+            matches.append((match.start(), word))
+    if not matches:
+        return None
+    position, word = max(matches)
+    if lowered[:position].rstrip().endswith("next") and word not in ("next week", "this week"):
+        return f"next {word}"
+    return word
+
+
+def _extract_time(text: str) -> str | None:
+    """Extract an explicitly stated time-of-day preference (last one wins)."""
+    lowered = text.lower()
+    matches: list[tuple[int, str]] = []
+    for word in _TIME_WORDS:
+        for match in re.finditer(rf"\b{re.escape(word)}\b", lowered):
+            matches.append((match.start(), word))
+    if not matches:
+        return None
+    return max(matches)[1]
+
+
+def _parse_context(context: str | None) -> dict[str, object]:
+    """Parse the bounded server-built context used by the mock provider."""
+    result: dict[str, object] = {
+        "active_request_type": None,
+        "active_request_details": {},
+        "awaiting_field": None,
+        "pending_confirmation": False,
+        "last_grounded_topic": None,
+    }
+    if not context:
+        return result
+    for raw_line in context.splitlines():
+        key, separator, value = raw_line.partition(":")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "active_request" and value:
+            parts = [part.strip() for part in value.split(";") if part.strip()]
+            if parts:
+                result["active_request_type"] = parts[0]
+                details: dict[str, str] = {}
+                for part in parts[1:]:
+                    if part.startswith("missing="):
+                        continue
+                    field, _, field_value = part.partition("=")
+                    if field and field_value:
+                        details[field.strip()] = field_value.strip()
+                result["active_request_details"] = details
+        elif key == "awaiting_field":
+            result["awaiting_field"] = value or None
+        elif key == "pending_confirmation":
+            result["pending_confirmation"] = value.lower() == "true"
+        elif key == "last_grounded_topic":
+            result["last_grounded_topic"] = value or None
+    return result
 
 
 class MockLLMProvider:
@@ -73,6 +158,7 @@ class MockLLMProvider:
             raise LLMConnectionError("mock provider connection failed")
 
         text = request.transcript.strip().lower()
+        context = _parse_context(request.context)
         if not text:
             result = self._empty_interpretation()
         elif any(hint in text for hint in _EMERGENCY_HINT):
@@ -83,7 +169,7 @@ class MockLLMProvider:
                 "unclear input — possible emergency phrase detected"
             )
         else:
-            result = self._match_scenario(text)
+            result = self._match_scenario(text, context=context)
 
         if self.simulate_malformed:
             raw = "{not valid json"
@@ -110,13 +196,55 @@ class MockLLMProvider:
 
     # --- scenario matching ---------------------------------------------------
 
-    def _match_scenario(self, text: str) -> InterpretationResult:
+    def _match_scenario(
+        self, text: str, *, context: dict[str, object] | None = None
+    ) -> InterpretationResult:
         """Match deterministic scenarios by keyword inclusion.
 
         Multiple independent requests in one utterance are preserved as
         separate entries. All categories are checked so multiple requests
         are captured in a single turn.
+
+        Day 9: when a bounded conversation context is supplied, a bare slot
+        value ("Wednesday", "afternoon") fills the active request, and a short
+        follow-up ("what about Saturday?") stays on the previous grounded
+        topic. This mirrors the real Gemini prompt contract without changing
+        the no-context behaviour used by the Day 5/6 corpora.
         """
+        ctx = context or {}
+        pending_confirmation = bool(ctx.get("pending_confirmation"))
+        active_type = ctx.get("active_request_type")
+        awaiting_field = ctx.get("awaiting_field")
+        last_topic = ctx.get("last_grounded_topic")
+
+        # Confirmation words are deliberately left to the deterministic
+        # controller. The model may still extract a correction ("yes, make it
+        # Thursday") because that contains a new slot value.
+        if pending_confirmation and not self._contains_slot_value(text):
+            return self._clarification_interpretation("confirmation response")
+
+        if isinstance(active_type, str) and self._looks_like_slot_value(
+            text, active_type=active_type, awaiting_field=awaiting_field
+        ):
+            return self._slot_fill_interpretation(active_type, text)
+
+        if (
+            isinstance(last_topic, str)
+            and last_topic
+            and not self._has_admin_keyword(text)
+            and self._looks_like_follow_up(text)
+        ):
+            return InterpretationResult(
+                intent="practice-information",
+                requests=[
+                    RequestDetail(
+                        request_type="practice-information",
+                        details={"topic": last_topic},
+                        missing_fields=[],
+                        source_quotes=[text],
+                    )
+                ],
+            )
 
         requests: list[RequestDetail] = []
 
@@ -230,6 +358,87 @@ class MockLLMProvider:
             clarification_reason=(
                 "Please tell me your preferred date and time." if missing_any else None
             ),
+        )
+
+    # --- Day 9 context helpers ----------------------------------------------
+
+    @staticmethod
+    def _contains_slot_value(text: str) -> bool:
+        return bool(
+            _extract_date(text)
+            or _extract_time(text)
+            or any(
+                marker in text for marker in ("actually", "change", "make it", "i meant", "instead")
+            )
+        )
+
+    @staticmethod
+    def _has_admin_keyword(text: str) -> bool:
+        return any(
+            keyword in text
+            for keyword in (
+                "appointment",
+                "book",
+                "schedule",
+                "prescription",
+                "repeat",
+                "medication",
+                "reschedule",
+                "move",
+                "cancel",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_follow_up(text: str) -> bool:
+        starters = (
+            "what about",
+            "how about",
+            "and ",
+            "also ",
+            "what time",
+            "what are",
+            "when ",
+            "where ",
+            "do you",
+            "does the",
+            "is there",
+            "are there",
+        )
+        return len(text.split()) <= 8 and (text.startswith(starters) or text.endswith("?"))
+
+    @staticmethod
+    def _looks_like_slot_value(text: str, *, active_type: str, awaiting_field: object) -> bool:
+        if awaiting_field == "preferred_date":
+            return _extract_date(text) is not None
+        if awaiting_field == "preferred_time":
+            return _extract_time(text) is not None
+        if awaiting_field in ("reason_as_stated", "reason_for_appointment"):
+            return bool(text.strip())
+        if active_type in ("appointment-request", "appointment-change-request"):
+            return bool(_extract_date(text) or _extract_time(text))
+        return False
+
+    def _slot_fill_interpretation(self, active_type: str, text: str) -> InterpretationResult:
+        details: dict[str, str | None] = {}
+        date = _extract_date(text)
+        if date is not None:
+            details["preferred_date"] = date
+        time_pref = _extract_time(text)
+        if time_pref is not None:
+            details["preferred_time"] = time_pref
+        if not details:
+            details["reason_as_stated"] = text
+        return InterpretationResult(
+            intent=active_type,
+            requests=[
+                RequestDetail(
+                    request_type=active_type,
+                    details=details,
+                    missing_fields=[],
+                    source_quotes=[text],
+                )
+            ],
         )
 
     # --- helpers -------------------------------------------------------------

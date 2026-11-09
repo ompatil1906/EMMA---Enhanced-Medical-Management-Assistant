@@ -19,3 +19,22 @@ test run is reproducible on every machine.
 The Day 2 success criterion is transport/protocol correctness, not audio
 content. Deterministic bytes make the "echoed == sent" assertion exact and
 prevent accidentally shipping any real-world recording into the repository.
+
+## Speech fixture (Day 18)
+
+`speech_gp_appointment.wav` — "Hello, I would like to book a routine GP
+appointment.", synthesised **locally** with the macOS speech synthesiser
+(`say -v Daniel`) and converted with `afconvert` to WAV / PCM16 / mono / 16 kHz
+(3.67 s, peak −1.6 dBFS, RMS −19.4 dBFS, 67 % voiced).
+
+It is **machine-generated speech**, not a human recording, not a telephone
+recording, and contains no patient data. It exists so a live provider smoke test
+can compare a transcript against a known reference. It is not evidence of human
+microphone recognition quality.
+
+Regenerate (no network, no cost):
+
+```bash
+.venv/bin/python -m tools.make_speech_fixture --out tests/fixtures/speech_gp_appointment.wav
+.venv/bin/python -m tools.make_speech_fixture --out /tmp/oneshot.wav --trailing-silence-ms 15000
+```

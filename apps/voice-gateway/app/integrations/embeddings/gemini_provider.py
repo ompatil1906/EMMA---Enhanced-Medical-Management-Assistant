@@ -89,7 +89,7 @@ class GeminiEmbeddingProvider:
             try:
                 response = await asyncio.wait_for(
                     self._client.post(url, json=payload),
-                    timeout=request.dimension and request.dimension or self._timeout_seconds,
+                    timeout=self._timeout_seconds,
                 )
                 break
             except TimeoutError as exc:

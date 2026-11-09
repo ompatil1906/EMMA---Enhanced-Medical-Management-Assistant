@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { openAudioPipeline, type AudioPipelineHandle } from "@/lib/voice/audio-pipeline";
 import { createGatewayTransport } from "@/lib/voice/gateway-transport";
+import { createLiveKitTransport } from "@/lib/voice/livekit-transport";
 import { createDemoTransport } from "@/lib/voice/demo-transport";
 import type {
   TranscriptLine,
@@ -24,6 +25,11 @@ import { cn } from "@/lib/utils";
 
 const GATEWAY_URL =
   process.env.NEXT_PUBLIC_VOICE_GATEWAY_URL ?? "ws://localhost:8000/ws/exotel";
+
+const VOICE_TRANSPORT =
+  process.env.NEXT_PUBLIC_VOICE_TRANSPORT ?? "websocket";
+
+const LIVEKIT_ROOM_NAME = "emma-voice";
 
 const LEVEL_INTERVAL_MS = 80;
 
@@ -101,11 +107,15 @@ export function VoiceScreen() {
         break;
       case "transcript":
         setTranscript((prev) => {
-          const base =
-            event.line.kind === "partial"
-              ? prev
-              : prev.filter((l) => l.kind !== "partial");
-          return [...base, event.line].slice(-6);
+          if (event.line.kind === "partial") {
+            const last = prev[prev.length - 1];
+            if (last && last.kind === "partial") {
+              return [...prev.slice(0, -1), event.line];
+            }
+            return [...prev, event.line].slice(-6);
+          }
+          const withoutPartials = prev.filter((l) => l.kind !== "partial");
+          return [...withoutPartials, event.line].slice(-6);
         });
         break;
       case "notice":
@@ -114,7 +124,7 @@ export function VoiceScreen() {
       case "metrics":
         setNotice({
           id: "metrics",
-          text: `echo verified · ${event.metrics.framesOut} frames · ⌀ ${event.metrics.rttMsAvg ?? "—"} ms`,
+          text: `live audio · ${event.metrics.framesOut} assistant frames`,
           sample: false,
         });
         break;
@@ -164,7 +174,17 @@ export function VoiceScreen() {
         return;
       }
       pipelineRef.current = livePipeline;
-      beginSession(createGatewayTransport({ url: GATEWAY_URL, pipeline: livePipeline }));
+
+      let transport: VoiceTransport;
+      if (VOICE_TRANSPORT === "livekit") {
+        transport = createLiveKitTransport({
+          baseUrl: GATEWAY_URL.replace(/^ws/, "http").replace(/^wss/, "https"),
+          roomName: LIVEKIT_ROOM_NAME,
+        });
+      } else {
+        transport = createGatewayTransport({ url: GATEWAY_URL, pipeline: livePipeline });
+      }
+      beginSession(transport);
     } else {
       try {
         pipelineRef.current = await openAudioPipeline();

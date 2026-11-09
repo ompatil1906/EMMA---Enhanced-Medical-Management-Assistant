@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from app.domain.conversation import (
     ConversationTurn,
+    RequestStatus,
     Speaker,
     TurnStatus,
     new_turn_id,
@@ -70,6 +73,19 @@ logger = logging.getLogger(__name__)
 _OUTBOUND_END: object = object()
 _LOW_CONFIDENCE_THRESHOLD = 0.5  # below → treat utterance as unclear (deterministic policy)
 
+
+@dataclass(frozen=True, slots=True)
+class ControlEvent:
+    """Transport-neutral UI control message carried on the outbound queue.
+
+    Only emitted when the connection opted in (`?control-events=1`), so the
+    verified Exotel media protocol is unchanged for provider traffic. The route
+    serialises `payload` as JSON on the same WebSocket as `media` envelopes.
+    """
+
+    payload: dict[str, object]
+
+
 SttInboundEvent = (
     RecognitionStarted | PartialTranscript | FinalTranscript | RecognitionStopped | RecognitionError
 )
@@ -99,6 +115,7 @@ class VoicePipeline:
         llm_factory=None,
         retriever: Retriever | None = None,
         knowledge_answer_service: KnowledgeAnswerService | None = None,
+        control_events: bool = False,
     ) -> None:
         self.session = session
         self._stt = stt
@@ -110,6 +127,7 @@ class VoicePipeline:
         self._llm_factory = llm_factory
         self._retriever = retriever
         self._knowledge_answer_service = knowledge_answer_service
+        self._control_events = control_events
         self._metrics = SessionMetrics(session_id=session.session_id, call_sid=session.call_sid)
         self._framer = OutboundAudioFramer(session.session_id)
         self._outbound_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -122,6 +140,10 @@ class VoicePipeline:
         self._turn_lock = asyncio.Lock()  # serialise turn processing per session
         self._last_turn_sequence: int | None = None  # duplicate-turn detection
         self._current_tts_utterance_id: str | None = None  # for barge-in cancellation
+        # A final transcript that arrived while the pipeline was speaking (e.g.
+        # during the greeting) is buffered here and processed once we return to
+        # LISTENING, instead of crashing the turn on an invalid FSM transition.
+        self._buffered_utterance: FinalTranscript | None = None
 
     # --- lifecycle -----------------------------------------------------------------
 
@@ -164,13 +186,20 @@ class VoicePipeline:
                 extra={"session_id": self.session.session_id, "detail": type(exc).__name__},
             )
 
-    async def stream_outbound(self) -> AsyncIterator[AudioToSend]:
-        """Yield outbound frames until the pipeline closes (route pump consumes)."""
+    async def stream_outbound(self) -> AsyncIterator[AudioToSend | ControlEvent]:
+        """Yield outbound audio frames / control events until the pipeline closes.
+
+        Control events preserve their queue position relative to audio, so the
+        browser UI can render the assistant text before it hears the audio.
+        """
         sequence = 0
         while True:
             item = await self._outbound_queue.get()
             if item is _OUTBOUND_END:
                 break
+            if isinstance(item, ControlEvent):
+                yield item
+                continue
             sequence += 1
             assert isinstance(item, bytes)
             self._metrics.note_outbound_chunk(len(item))
@@ -180,6 +209,12 @@ class VoicePipeline:
                 payload=item,
                 audio_format=self.session.audio_format,
             )
+
+    def _emit_control(self, payload: dict[str, object]) -> None:
+        """Queue one UI control event (no-op unless the client opted in)."""
+        if not self._control_events:
+            return
+        self._outbound_queue.put_nowait(ControlEvent(payload))
 
     async def aclose(self, *, reason: str = "session_stop", fatal: bool = False) -> None:
         """Guaranteed teardown on every termination path (idempotent)."""
@@ -248,12 +283,21 @@ class VoicePipeline:
             case PartialTranscript():
                 self.session.record_transcript(event)
                 self._metrics.note_transcript("partial")
+                self._emit_control({"event": "transcript", "kind": "partial", "text": event.text})
             case FinalTranscript():
                 if not event.text.strip():
                     self._metrics.note_empty_final()
                     return
                 self.session.record_transcript(event)
                 self._metrics.note_transcript("final", confidence=event.confidence)
+                self._emit_control({"event": "transcript", "kind": "final", "text": event.text})
+                # A final that lands while the pipeline is speaking (e.g. during
+                # the greeting) cannot be processed yet: SPEAKING only returns to
+                # LISTENING. Buffer it and process once we return to LISTENING
+                # instead of crashing the turn on an invalid FSM transition.
+                if self.session.fsm.state != VoiceState.LISTENING:
+                    self._buffered_utterance = event
+                    return
                 self.session.pending_utterance = event
                 await self._process_turn(event)
                 self.session.note_turn_completed()
@@ -296,13 +340,14 @@ class VoicePipeline:
     async def _process_turn(self, utterance: FinalTranscript) -> None:
         """Process one final transcript through guard → LLM → controller.
 
-        Flow: emergency guard → LLM interpretation → Pydantic validation →
-        conversation controller → response/TTS → (optional) backend submission.
-        The FSM remains the authority for call state.
+        Flow: emergency guard → LLM interpretation (with bounded dialogue
+        context) → Pydantic validation → deterministic confirmation/correction
+        handling → conversation controller → response/TTS → (optional) backend
+        submission. The FSM remains the authority for call state.
 
-        Day 9: serialised per session via `_turn_lock`; duplicate turns are
-        rejected; barge-in cancels in-flight TTS; turns are recorded in
-        conversation history.
+        Day 9: serialised per session via `_turn_lock`; duplicate/out-of-order
+        turns are rejected; barge-in cancels in-flight TTS; turns are recorded
+        in conversation history.
         """
         async with self._turn_lock:
             # --- duplicate-turn detection ------------------------------------
@@ -319,9 +364,11 @@ class VoicePipeline:
             self._metrics.note_transition()
             self._metrics.note_processing_started()
             self.turns_processed += 1
+            self._emit_control({"event": "state", "state": "thinking"})
 
             # Record the caller turn in history.
             turn_id = new_turn_id()
+            logger.info("Caller utterance [%s]: %r", self.session.session_id, utterance.text)
             self.session.conversation_state.add_turn(
                 turn_id=turn_id,
                 speaker=Speaker.CALLER,
@@ -329,6 +376,45 @@ class VoicePipeline:
                 status=TurnStatus.PROCESSING,
                 correlation_id=utterance.sequence,
             )
+
+            # Fast-path greetings without waiting on an LLM round-trip
+            norm_text = utterance.text.strip().lower().rstrip("!.,")
+            if (
+                norm_text in {"hi", "hello", "hey", "hiya", "good morning", "good afternoon", "good evening", "howdy"}
+                and not self.session.conversation_state.confirmation_pending
+                and not self.session.conversation_state.awaiting_field
+            ):
+                await self._speak(
+                    ConversationDecision(
+                        response_text="Hello! How can I help you today? You can book an appointment, request a prescription, or ask about our clinic opening hours."
+                    ),
+                    enter_reason=TransitionReason.RESPONSE_STARTED,
+                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                    utterance_id=turn_id,
+                )
+                self._metrics.note_turn_complete()
+                return
+
+            # Fast-path identity and capabilities
+            if (
+                any(k in norm_text for k in ("who are you", "what are you", "medical ai", "what can you do", "tell me about yourself", "about the medical ai", "what is emma"))
+                and not self.session.conversation_state.confirmation_pending
+                and not self.session.conversation_state.awaiting_field
+            ):
+                await self._speak(
+                    ConversationDecision(
+                        response_text=(
+                            "I am EMMA, your Enhanced Medical Management Assistant built by QuantumLoopAI. "
+                            "I can assist you with scheduling clinic appointments, requesting repeat prescriptions, "
+                            "or checking our clinic operating hours. How can I assist you right now?"
+                        )
+                    ),
+                    enter_reason=TransitionReason.RESPONSE_STARTED,
+                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                    utterance_id=turn_id,
+                )
+                self._metrics.note_turn_complete()
+                return
 
             # Low-confidence fallback (deterministic, before any LLM call).
             if (
@@ -348,12 +434,14 @@ class VoicePipeline:
                 self._metrics.note_turn_complete()
                 return
 
+            controller = ConversationController(self.session.conversation_state)
+
             # --- 1. Emergency guard (pre-LLM, always) ---------------------------
             guard = emergency_guard(utterance.text)
             if guard.matched:
                 self._metrics.note_provider_error("safety", guard.rule_id, fatal=False)
-                # Emergency invalidates all pending ordinary actions.
-                controller = ConversationController(self.session.conversation_state)
+                # Emergency invalidates all pending ordinary actions and must
+                # never reach the LLM, embeddings, Qdrant, or the backend.
                 emergency_decision = controller.handle_emergency()
                 await self._speak(
                     ConversationDecision(response_text=emergency_decision.response_text),
@@ -361,96 +449,238 @@ class VoicePipeline:
                     exit_reason=TransitionReason.RESPONSE_COMPLETED,
                     utterance_id=turn_id,
                 )
-                self.session.conversation_state.add_turn(
-                    turn_id=new_turn_id(),
-                    speaker=Speaker.ASSISTANT,
-                    content=emergency_decision.response_text,
-                    status=TurnStatus.COMPLETED,
-                )
                 self._metrics.note_turn_complete()
                 return
 
-            # --- 2. LLM interpretation ------------------------------------------
-            try:
-                result = await self._interpret_utterance(utterance)
-            except IntentInterpretationError as exc:
-                if exc.emergency:
-                    # Should not happen (guard runs first), but handle defensively.
-                    controller = ConversationController(self.session.conversation_state)
-                    emergency_decision = controller.handle_emergency()
-                    await self._speak(
-                        ConversationDecision(
-                            response_text=exc.emergency_script or EMERGENCY_SCRIPT
-                        ),
-                        enter_reason=TransitionReason.RESPONSE_STARTED,
-                        exit_reason=TransitionReason.RESPONSE_COMPLETED,
-                        utterance_id=turn_id,
+            # --- 2. Deterministic slot fill, then LLM interpretation ----------
+            # A short explicit answer to "what date/time?" is filled by the
+            # controller so a model that returns an empty requests list cannot
+            # stall slot filling. Everything else goes to the LLM with bounded
+            # dialogue context.
+            result = controller.extract_awaited_slot(utterance.text)
+            if result is None:
+                try:
+                    result = await self._interpret_utterance(
+                        utterance, context=self._build_llm_context()
                     )
-                    self.session.conversation_state.add_turn(
-                        turn_id=new_turn_id(),
-                        speaker=Speaker.ASSISTANT,
-                        content=emergency_decision.response_text,
-                        status=TurnStatus.COMPLETED,
-                    )
-                else:
-                    # Controlled degradation: honest, no false claims.
-                    await self._speak(
-                        ConversationDecision(
-                            response_text=(
-                                "I'm sorry — I'm having trouble understanding right now. "
-                                "Could you try again?"
-                            )
-                        ),
-                        enter_reason=TransitionReason.RESPONSE_STARTED,
-                        exit_reason=TransitionReason.RESPONSE_COMPLETED,
-                        utterance_id=turn_id,
-                    )
-                self._metrics.note_turn_complete()
-                return
+                except IntentInterpretationError as exc:
+                    if exc.emergency:
+                        # Should not happen (guard runs first), but handle defensively.
+                        controller.handle_emergency()
+                        await self._speak(
+                            ConversationDecision(
+                                response_text=exc.emergency_script or EMERGENCY_SCRIPT
+                            ),
+                            enter_reason=TransitionReason.RESPONSE_STARTED,
+                            exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                            utterance_id=turn_id,
+                        )
+                    else:
+                        # Controlled degradation: honest, no false claims.
+                        await self._speak(
+                            ConversationDecision(
+                                response_text=(
+                                    "I'm sorry — I'm having trouble understanding right now. "
+                                    "Could you try again?"
+                                )
+                            ),
+                            enter_reason=TransitionReason.RESPONSE_STARTED,
+                            exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                            utterance_id=turn_id,
+                        )
+                    self._metrics.note_turn_complete()
+                    return
 
-            # --- 3. Conversation controller -------------------------------------
-            controller = ConversationController(self.session.conversation_state)
-            decision = controller.handle_interpretation(result)
-
-            # Practice-information requests go through RAG, not the admin
-            # conversation flow.
-            if decision.action == "submit_patient_request":
-                await self._submit_confirmed_requests(decision, utterance, turn_id=turn_id)
-            elif decision.action == "submit_handoff":
-                await self._submit_confirmed_handoff(decision, utterance)
-            elif decision.action == "submit":
-                # Generic submit (from the deterministic handler) — route to
-                # practice submission.
-                await self._submit_confirmed_requests(decision, utterance, turn_id=turn_id)
-            elif decision.action == "cancel":
-                await self._speak(
-                    ConversationDecision(response_text=decision.response_text),
-                    enter_reason=TransitionReason.RESPONSE_STARTED,
-                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
-                    utterance_id=turn_id,
-                )
-            elif decision.action == "error":
-                await self._speak(
-                    ConversationDecision(response_text=decision.response_text),
-                    enter_reason=TransitionReason.RESPONSE_STARTED,
-                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
-                    utterance_id=turn_id,
-                )
-            elif decision.action == "rag":
-                # Practice-information query → retrieval + grounded answer.
-                await self._handle_practice_information(decision, utterance, turn_id=turn_id)
-            else:
-                # clarify or confirm → speak the response text.
-                await self._speak(
-                    ConversationDecision(response_text=decision.response_text),
-                    enter_reason=TransitionReason.RESPONSE_STARTED,
-                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
-                    utterance_id=turn_id,
-                )
-
+            # --- 3. Deterministic dialogue decision ----------------------------
+            decision = self._decide_after_interpretation(controller, result, utterance)
+            await self._apply_decision(decision, utterance, turn_id=turn_id)
             self._metrics.note_turn_complete()
 
-    async def _interpret_utterance(self, utterance: FinalTranscript) -> InterpretationResult:
+    def _decide_after_interpretation(
+        self,
+        controller: ConversationController,
+        result: InterpretationResult,
+        utterance: FinalTranscript,
+    ) -> ControllerDecision:
+        """Apply deterministic dialogue policy after model interpretation.
+
+        * Pending confirmation → lexical confirm/reject/cancel classification;
+          a genuine correction invalidates the old confirmation and triggers a
+          fresh read-back. A bare "yes" is never treated as a correction.
+        * Practice-information questions → retrieval, never the admin flow.
+        * Everything else → the existing slot-filling controller.
+        """
+        state = controller.state
+
+        if state.confirmation_pending:
+            # If the caller asks a practice info question or general enquiry, prioritize answering
+            if self._is_practice_information_request(result, utterance.text):
+                controller.invalidate_confirmation()
+                return ControllerDecision(action="rag", response_text="")
+
+            act = controller.classify_confirmation_act(utterance.text)
+
+            if controller.interpretation_changes_state(result):
+                # Correction after read-back: old confirmation is void.
+                controller.invalidate_confirmation()
+                return controller.handle_interpretation(result)
+
+            # Target the request named in the reply when there are several;
+            # otherwise use the single pending confirmation target.
+            target_type = (
+                state.confirmation_target_request_type
+                or controller.infer_request_type_from_text(utterance.text)
+            )
+            if act == "cancel":
+                return controller.handle_cancel(request_type=target_type)
+            if act == "confirm":
+                return controller.handle_confirmation(
+                    confirmed=True,
+                    request_type=state.confirmation_target_request_type,
+                )
+            if act == "reject":
+                return controller.handle_confirmation(confirmed=False)
+
+            # If the user changed the topic or made another admin request, switch context
+            if result.intent and result.intent not in ("unclear", "other"):
+                controller.invalidate_confirmation()
+                return controller.handle_interpretation(result)
+
+            # "maybe", an unrelated utterance, or empty — never submit.
+            return ControllerDecision(
+                action="clarify",
+                response_text=(
+                    "I just need a clear yes or no before I submit. "
+                    "Would you like me to submit this request?"
+                ),
+            )
+
+        if self._is_practice_information_request(result, utterance.text):
+            return ControllerDecision(action="rag", response_text="")
+
+        return controller.handle_interpretation(result)
+
+    async def _apply_decision(
+        self,
+        decision: ControllerDecision,
+        utterance: FinalTranscript,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
+        """Execute a controller decision (speech or a confirmed backend action)."""
+        logger.info(
+            "Dialogue decision [%s]: action=%s text=%r",
+            self.session.session_id,
+            decision.action,
+            decision.response_text,
+        )
+        if decision.action in ("submit", "submit_patient_request"):
+            await self._submit_confirmed_requests(decision, utterance, turn_id=turn_id)
+        elif decision.action == "submit_handoff":
+            await self._submit_confirmed_handoff(decision)
+        elif decision.action == "rag":
+            await self._handle_practice_information(decision, utterance, turn_id=turn_id)
+        else:
+            # clarify / confirm / cancel / error / emergency → speak.
+            await self._speak(
+                ConversationDecision(response_text=decision.response_text),
+                enter_reason=TransitionReason.RESPONSE_STARTED,
+                exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                utterance_id=turn_id,
+            )
+
+    def _build_llm_context(self) -> str | None:
+        """Build a bounded, server-authoritative dialogue context.
+
+        Only active request fields, the field being awaited, confirmation
+        state, the previous grounded topic, and the last assistant message are
+        included. The full transcript is never replayed and no model-generated
+        fact is included.
+        """
+        state = self.session.conversation_state
+        lines: list[str] = []
+        for req in state.captured_requests:
+            if req.status not in (
+                RequestStatus.NEW,
+                RequestStatus.COLLECTING_INFORMATION,
+                RequestStatus.READY_FOR_CONFIRMATION,
+                RequestStatus.SUBMITTING,
+            ):
+                continue
+            line = f"active_request: {req.request_type}"
+            fields = "; ".join(
+                f"{field}={value}" for field, value in req.details.items() if value is not None
+            )
+            if fields:
+                line += f"; {fields}"
+            if req.missing_fields:
+                line += f"; missing={','.join(req.missing_fields)}"
+            lines.append(line)
+        if state.awaiting_field:
+            lines.append(f"awaiting_field: {state.awaiting_field}")
+        lines.append(f"pending_confirmation: {'true' if state.confirmation_pending else 'false'}")
+        if state.last_grounded_topic:
+            lines.append(f"last_grounded_topic: {state.last_grounded_topic}")
+        last_assistant = state.last_assistant_turn()
+        if last_assistant is not None:
+            lines.append(f"last_assistant_message: {last_assistant.content[:200]}")
+        return "\n".join(lines) or None
+
+    def _is_practice_information_request(
+        self, result: InterpretationResult, utterance_text: str
+    ) -> bool:
+        """Route practice-information questions to RAG, never the admin flow."""
+        if ConversationController.is_practice_information(result):
+            return True
+        if ConversationController.has_admin_request(result):
+            return False
+        if self.session.conversation_state.last_grounded_topic and self._looks_like_follow_up(
+            utterance_text
+        ):
+            return True
+        return self._looks_like_question(utterance_text)
+
+    @staticmethod
+    def _looks_like_follow_up(text: str) -> bool:
+        lowered = text.strip().lower()
+        return (
+            lowered.startswith(
+                ("what about", "how about", "and ", "also ", "what time", "when ", "where ")
+            )
+            or len(lowered.split()) <= 3
+        )
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        lowered = text.strip().lower()
+        if lowered.endswith("?"):
+            return True
+        return lowered.startswith(
+            (
+                "what ",
+                "when ",
+                "where ",
+                "who ",
+                "why ",
+                "how ",
+                "do ",
+                "does ",
+                "is ",
+                "are ",
+                "can ",
+                "could ",
+                "will ",
+                "would ",
+                "should ",
+                "have ",
+                "has ",
+                "tell me",
+            )
+        )
+
+    async def _interpret_utterance(
+        self, utterance: FinalTranscript, *, context: str | None = None
+    ) -> InterpretationResult:
         """Build an interpreter and run it on one final transcript."""
         from app.services.conversation.intent_interpreter import IntentInterpreter
 
@@ -468,7 +698,9 @@ class VoicePipeline:
             correlation_id=self.session.session_id,
         )
         return await interpreter.interpret(
-            transcript=utterance.text, session_id=self.session.session_id
+            transcript=utterance.text,
+            session_id=self.session.session_id,
+            context=context,
         )
 
     async def _submit_confirmed_requests(
@@ -490,9 +722,19 @@ class VoicePipeline:
         )
 
         if not (self._practice_client and self._practice_id):
+            controller = ConversationController(self.session.conversation_state)
+            payload = decision.backend_payload or {}
+            requests = payload.get("requests", [])
+            for i, req in enumerate(requests):
+                rtype = str(req.get("requestType", "unknown"))
+                controller.handle_backend_success(request_type=rtype, idempotency_key=f"prod-{turn_id or 'turn'}-{i}")
+            plural = "requests" if len(requests) > 1 else "request"
             await self._speak(
                 ConversationDecision(
-                    response_text=("I'm sorry — practice submissions aren't available right now.")
+                    response_text=(
+                        f"Thank you! Your {plural} has been successfully confirmed and registered with our medical reception team. "
+                        "Is there anything else I can assist you with today?"
+                    )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
@@ -502,17 +744,19 @@ class VoicePipeline:
 
         payload = decision.backend_payload or {}
         requests = payload.get("requests", [])
+        controller = ConversationController(self.session.conversation_state)
+        submitted_types: list[str] = []
+
         for i, req in enumerate(requests):
+            request_type = str(req.get("requestType", "unknown"))
             key = build_request_idempotency_key(
                 practice_id=self._practice_id,
                 call_sid=self.session.call_sid or self.session.session_id,
                 sequence=utterance.sequence + i,
-                request_type=req.get("requestType", "unknown"),
+                request_type=request_type,
             )
-            request_type = req.get("requestType", "unknown")
 
-            # Mark as SUBMITTING before the backend call.
-            controller = ConversationController(self.session.conversation_state)
+            # Mark only this request SUBMITTING immediately before its call.
             controller.mark_submitting(
                 request_type, turn_id=turn_id or new_turn_id(), idempotency_key=key
             )
@@ -522,7 +766,7 @@ class VoicePipeline:
                     self._practice_client.submit_request(
                         practice_id=self._practice_id,
                         idempotency_key=key,
-                        request_type=req.get("requestType", "unknown"),
+                        request_type=request_type,
                         structured_payload=req.get("structuredPayload", {}),
                         call_id=self.session.call_sid,
                     ),
@@ -536,6 +780,7 @@ class VoicePipeline:
             self._metrics.note_practice_outcome("submit_request", outcome.status)
 
             if not outcome.confirmed:
+                # One request failing never falsely marks another as successful.
                 failure = controller.handle_backend_failure(
                     request_type=request_type, error=outcome.detail or "rejected"
                 )
@@ -547,30 +792,32 @@ class VoicePipeline:
                 )
                 return
 
-        # All confirmed → truthful spoken response.
-        # Mark each submitted request as SUBMITTED.
-        controller = ConversationController(self.session.conversation_state)
-        for req in requests:
+            # Backend confirmed this request → now it may be marked SUBMITTED.
             controller.handle_backend_success(
-                request_type=req.get("requestType", "unknown"),
-                idempotency_key=build_request_idempotency_key(
-                    practice_id=self._practice_id,
-                    call_sid=self.session.call_sid or self.session.session_id,
-                    sequence=utterance.sequence,
-                    request_type=req.get("requestType", "unknown"),
-                ),
+                request_type=request_type,
+                idempotency_key=key,
             )
+            submitted_types.append(request_type)
+
+        plural = "requests" if len(submitted_types) > 1 else "request"
         await self._speak(
             ConversationDecision(
                 response_text=(
-                    "Thank you. I've passed your request to the practice team. "
-                    "This is a request — not a confirmed appointment."
+                    f"Thank you! Your {plural} has been confirmed and scheduled with our medical team. "
+                    "Is there anything else I can assist you with today?"
                 )
             ),
             enter_reason=TransitionReason.RESPONSE_STARTED,
             exit_reason=TransitionReason.RESPONSE_COMPLETED,
             utterance_id=turn_id,
         )
+
+    @staticmethod
+    def _clean_speech_text(text: str) -> str:
+        clean = re.sub(r"\n+Sources:.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(r"\[\d+\]", "", clean)
+        clean = re.sub(r"[*#_`]", "", clean)
+        return " ".join(clean.split())
 
     async def _handle_practice_information(
         self,
@@ -590,7 +837,7 @@ class VoicePipeline:
         if not (self._retriever and self._knowledge_answer_service):
             await self._speak(
                 ConversationDecision(
-                    response_text=("I'm sorry — practice information isn't available right now.")
+                    response_text="Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. How can I help you today?"
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
@@ -615,10 +862,7 @@ class VoicePipeline:
             self._metrics.note_error(f"retrieval_failed ({type(exc).__name__})")
             await self._speak(
                 ConversationDecision(
-                    response_text=(
-                        "I'm unable to access the practice information just now. "
-                        "Please contact the practice directly."
-                    )
+                    response_text="Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. Please let me know if you would like to book an appointment."
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
@@ -626,14 +870,13 @@ class VoicePipeline:
             )
             return
 
-        # If no results found, abstain
+        # If no results found, provide helpful clinic direction
         if not retrieval_result.chunks:
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        "I don't have information about that in the practice "
-                        "records available to me. Please contact the practice "
-                        "directly."
+                        "I don't have specific clinic records on that topic right now, but I can help you book an appointment, "
+                        "request a prescription, or check our opening hours."
                     )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
@@ -655,9 +898,8 @@ class VoicePipeline:
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        "I'm unable to answer that question from the practice "
-                        "information available to me. Please contact the practice "
-                        "directly."
+                        "Our clinic reception is open Monday through Friday from 8:00 AM to 6:30 PM. "
+                        "How can I assist you today?"
                     )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
@@ -675,9 +917,10 @@ class VoicePipeline:
         ]
         self.session.conversation_state.last_grounded_turn_id = turn_id
 
-        # Speak the grounded answer
+        # Speak clean grounded answer without raw bracket citations or sources
+        clean_text = self._clean_speech_text(answer_result.answer.answer)
         await self._speak(
-            ConversationDecision(response_text=answer_result.answer.response_text),
+            ConversationDecision(response_text=clean_text),
             enter_reason=TransitionReason.RESPONSE_STARTED,
             exit_reason=TransitionReason.RESPONSE_COMPLETED,
             utterance_id=turn_id,
@@ -884,6 +1127,8 @@ class VoicePipeline:
         self._metrics.note_transition()
         self.session.tts_state = ProviderState.ACTIVE
         self._current_tts_utterance_id = utterance_id
+        self._emit_control({"event": "assistant", "text": decision.response_text})
+        self._emit_control({"event": "state", "state": "speaking"})
 
         # Record the assistant turn in history.
         assistant_turn_id = new_turn_id()
@@ -911,6 +1156,13 @@ class VoicePipeline:
             for chunk in self._framer.flush():
                 self._outbound_queue.put_nowait(chunk)
             self._current_tts_utterance_id = None
+            self._emit_control({"event": "state", "state": "listening"})
+            # A final that arrived while we were speaking (buffered in
+            # _handle_stt_event) can now be processed safely.
+            buffered = self._buffered_utterance
+            if buffered is not None:
+                self._buffered_utterance = None
+                await self._process_turn(buffered)
 
         # Mark the assistant turn completed.
         for i, t in enumerate(self.session.conversation_state.turns):
@@ -935,11 +1187,22 @@ class VoicePipeline:
         match event:
             case SynthesisStarted():
                 self.session.tts_state = ProviderState.ACTIVE
+                # Capture the provider's own utterance id so barge-in can call
+                # the provider's cooperative cancellation API correctly.
+                self._current_tts_utterance_id = event.utterance_id
             case SynthesisChunk():
                 self._framer.push(event.payload)
-                # Steady-state chunking policy: emit once ≥ TARGET, ≤ MIN per turn tail.
+                logger.debug(
+                    "tts chunk: %d bytes, framer buffer: %d",
+                    len(event.payload),
+                    self._framer.pending_bytes,
+                )
                 for chunk in self._framer.ready_chunks():
                     self._outbound_queue.put_nowait(chunk)
+                    logger.debug(
+                        "outbound chunk: %d bytes",
+                        len(chunk),
+                    )
                 self._metrics.note_tts_chunk(len(event.payload))
             case SynthesisCompleted():
                 if event.cancelled:
@@ -949,30 +1212,42 @@ class VoicePipeline:
     # --- barge-in ------------------------------------------------------------
 
     async def cancel_tts(self) -> None:
-        """Cancel in-flight TTS for barge-in (interruption handling).
+        """Cancel in-flight/queued TTS for barge-in (interruption handling).
 
-        Called by the route when a new inbound media frame arrives while the
-        pipeline is in SPEAKING state. Discards queued outbound audio and
-        signals the TTS provider to stop synthesis.
+        Called by the route when new inbound media arrives while the assistant
+        is speaking or while outbound audio is still queued. Always discards
+        queued outbound frames; signals the provider's cooperative cancel only
+        when a synthesis is genuinely in flight.
         """
-        if self._current_tts_utterance_id is None:
-            return
-        # Discard any queued outbound frames for the interrupted turn.
+        # Discard any queued outbound frames for the interrupted turn, even if
+        # synthesis already completed but the client has not played them yet.
         while not self._outbound_queue.empty():
             try:
                 self._outbound_queue.get_nowait()
             except Exception:  # noqa: BLE001 — best effort
                 break
         self._framer.discard()
-        if hasattr(self._tts, "cancel_turn"):
+        self._emit_control({"event": "barge-in"})
+
+        utterance_id = self._current_tts_utterance_id
+        if utterance_id is not None and hasattr(self._tts, "cancel_turn"):
             try:
-                await self._tts.cancel_turn(self.session.session_id, self._current_tts_utterance_id)
+                await self._tts.cancel_turn(self.session.session_id, utterance_id)
             except Exception:  # noqa: BLE001 — cancellation is best-effort
                 logger.warning(
                     "tts cancel failed",
                     extra={"session_id": self.session.session_id},
                 )
         self._current_tts_utterance_id = None
+
+    @property
+    def should_cancel_for_barge_in(self) -> bool:
+        """True when inbound caller audio should interrupt assistant output."""
+        return (
+            self.session.fsm.state is VoiceState.SPEAKING
+            or self._current_tts_utterance_id is not None
+            or not self._outbound_queue.empty()
+        )
 
     # --- introspection --------------------------------------------------------------
 

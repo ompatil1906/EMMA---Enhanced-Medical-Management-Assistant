@@ -32,8 +32,12 @@ Configuration is validated at startup; provider construction errors close
 
 from __future__ import annotations
 
+import array
 import asyncio
 import hmac
+import json
+import math
+import sys
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -42,7 +46,6 @@ from app.core.config import Settings, get_settings
 from app.core.lifecycle import GatewayState
 from app.core.logging import get_logger
 from app.domain.audio import SUPPORTED_SAMPLE_RATES, AudioFormat
-from app.domain.fsm import VoiceState
 from app.domain.session import VoiceSession
 from app.domain.speech_session import MediaFormatChangedError
 from app.integrations.exotel.adapter import (
@@ -72,6 +75,27 @@ _CLOSE_NEGOTIATION = 1008
 _CLOSE_TOO_BIG = 1009
 _CLOSE_INTERNAL = 1011
 _CLOSE_SESSIONS_EXHAUSTED = 1013
+
+# Day 10 barge-in policy: a continuously streaming browser microphone sends
+# silence too, so "any inbound frame while speaking" would cut off every reply.
+# Only genuine caller energy may interrupt assistant output.
+_BARGE_IN_RMS_THRESHOLD = 800.0  # PCM16 RMS (~ -32 dBFS); requires clear voice
+_BARGE_IN_MIN_FRAMES = 5  # 100 ms of speech at the browser's 20 ms cadence
+
+
+def _pcm16_rms(payload: bytes) -> float:
+    """Root-mean-square of little-endian PCM16 samples (0.0 when too short)."""
+    if len(payload) < 2:
+        return 0.0
+    sample_count = len(payload) // 2
+    samples = array.array("h")
+    samples.frombytes(payload[: sample_count * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    return math.sqrt(total / sample_count)
 
 
 class _NegotiationRejection(Exception):
@@ -188,6 +212,10 @@ async def exotel_media_stream(websocket: WebSocket) -> None:
     session = VoiceSession(provider=settings.EXOTEL_MODE)
     if query_format is not None:
         session.audio_format = query_format
+    # Browser UI opt-in: emit JSON control events alongside `media` envelopes.
+    # Provider (Exotel) traffic never sets this, so the verified media protocol
+    # stays byte-compatible.
+    control_events = websocket.query_params.get("control-events") in ("1", "true", "yes")
     state.registry.register(session)
     logger.info(
         "ws session opened",
@@ -195,7 +223,9 @@ async def exotel_media_stream(websocket: WebSocket) -> None:
     )
 
     if settings.VOICE_PIPELINE == "speech":
-        exit_close = await _session_loop_speech(websocket, session, state, settings, adapter)
+        exit_close = await _session_loop_speech(
+            websocket, session, state, settings, adapter, control_events=control_events
+        )
     else:
         exit_close = await _session_loop_echo(websocket, session, settings, adapter, state)
 
@@ -392,7 +422,11 @@ async def _session_loop_echo(
 
 
 def _build_speech_pipeline(
-    session: VoiceSession, state: GatewayState, settings: Settings
+    session: VoiceSession,
+    state: GatewayState,
+    settings: Settings,
+    *,
+    control_events: bool = False,
 ) -> object:
     """Construct one VoicePipeline from the validated provider factory."""
     from app.domain.speech_session import SpeechSession as _SpeechSession
@@ -443,6 +477,8 @@ def _build_speech_pipeline(
         settings=settings,
         retriever=retriever,
         knowledge_answer_service=knowledge_answer_service,
+        llm_factory=state.llm_factory,
+        control_events=control_events,
     )
 
 
@@ -452,14 +488,17 @@ async def _session_loop_speech(
     state: GatewayState,
     settings: Settings,
     adapter: ExotelAdapter,
+    *,
+    control_events: bool = False,
 ) -> tuple[int, str] | None:
     """Speech-pipeline loop: pipeline owns audio; the route stays transport-only."""
-    from app.services.voice_pipeline import PipelineFatallyFailed, VoicePipeline
+    from app.services.voice_pipeline import ControlEvent, PipelineFatallyFailed, VoicePipeline
     from app.speech.base import ProviderConfigurationError
 
     pipeline: VoicePipeline | None = None
     pump_task: asyncio.Task[None] | None = None
     consecutive_errors = 0
+    barge_in_frames = 0
     exit_close: tuple[int, str] | None = None
 
     def protocol_rejected(detail: str) -> bool:
@@ -480,11 +519,14 @@ async def _session_loop_speech(
         """Drain the pipeline's outbound queue → `media` envelopes (turn-shaped)."""
         assert pipeline is not None
         try:
-            async for frame in pipeline.stream_outbound():
-                outbound_json = build_outbound_media_envelope(frame, stream_sid=session.stream_sid)
+            async for item in pipeline.stream_outbound():
+                if isinstance(item, ControlEvent):
+                    await websocket.send_text(json.dumps(item.payload, separators=(",", ":")))
+                    continue
+                outbound_json = build_outbound_media_envelope(item, stream_sid=session.stream_sid)
                 await websocket.send_text(outbound_json)
                 session.frames_sent += 1
-                session.bytes_sent += len(frame.payload)
+                session.bytes_sent += len(item.payload)
         except (WebSocketDisconnect, RuntimeError):
             logger.warning("ws outbound send failed (peer gone)", extra=_session_log(session))
         except Exception:  # noqa: BLE001 — pump crash surfaces at teardown
@@ -565,7 +607,9 @@ async def _session_loop_speech(
                             ),
                         )
                         try:
-                            pipeline = _build_speech_pipeline(session, state, settings)
+                            pipeline = _build_speech_pipeline(
+                                session, state, settings, control_events=control_events
+                            )
                         except ProviderConfigurationError as exc:
                             logger.error(
                                 "speech provider misconfigured (no silent fallback)",
@@ -643,18 +687,27 @@ async def _session_loop_speech(
                         )
                         exit_close = (_CLOSE_NEGOTIATION, "unsupported media renegotiation")
                         break
-                    # --- Day 9: barge-in ---------------------------------------
-                    # If a new inbound media frame arrives while the pipeline is
-                    # speaking, cancel the in-flight TTS so the caller can
-                    # interrupt the assistant's response.
-                    if pipeline is not None and pipeline.session.fsm.state is VoiceState.SPEAKING:
-                        try:
-                            await pipeline.cancel_tts()
-                        except Exception:  # noqa: BLE001 — barge-in is best-effort
-                            logger.exception(
-                                "barge-in cancel failed",
-                                extra=_session_log(session),
-                            )
+                    # --- Day 9/10: barge-in -----------------------------------
+                    # If genuine caller speech arrives while the assistant is
+                    # speaking (or outbound audio is still queued), cancel the
+                    # in-flight/queued TTS. Silence and low-level noise must
+                    # not interrupt a reply (the browser mic streams always).
+                    if pipeline is not None and pipeline.should_cancel_for_barge_in:
+                        if _pcm16_rms(audio_in.payload) >= _BARGE_IN_RMS_THRESHOLD:
+                            barge_in_frames += 1
+                        else:
+                            barge_in_frames = 0
+                        if barge_in_frames >= _BARGE_IN_MIN_FRAMES:
+                            barge_in_frames = 0
+                            try:
+                                await pipeline.cancel_tts()
+                            except Exception:  # noqa: BLE001 — barge-in is best-effort
+                                logger.exception(
+                                    "barge-in cancel failed",
+                                    extra=_session_log(session),
+                                )
+                    else:
+                        barge_in_frames = 0
                 case ExotelStop():
                     logger.info(
                         "stream stopped by provider",
@@ -667,10 +720,21 @@ async def _session_loop_speech(
                 case ExotelMarkIn():
                     logger.debug("mark event tolerated", extra=_session_log(session))
                 case ExotelUnknownEvent():
-                    logger.debug(
-                        "unknown event tolerated (no crash)",
-                        extra=_session_log(session, event=event.event),
-                    )
+                    if event.event == "barge-in" and pipeline is not None:
+                        # Browser-only control event: explicit client-side
+                        # acoustic interruption. Exotel never sends this.
+                        try:
+                            await pipeline.cancel_tts()
+                        except Exception:  # noqa: BLE001 — barge-in is best-effort
+                            logger.exception(
+                                "barge-in event cancel failed",
+                                extra=_session_log(session),
+                            )
+                    else:
+                        logger.debug(
+                            "unknown event tolerated (no crash)",
+                            extra=_session_log(session, event=event.event),
+                        )
                 case _:
                     logger.debug("unmodelled event acked", extra=_session_log(session))
 

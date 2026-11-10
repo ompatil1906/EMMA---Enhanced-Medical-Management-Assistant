@@ -226,6 +226,20 @@ class GeminiLLMProvider:
                 f"{request.transcript}"
             )
 
+        generation_config: dict[str, Any] = {
+            "temperature": 0.2,
+            "maxOutputTokens": request.max_output_tokens,
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema,
+        }
+        # Flash models burn 1–3 s of internal "thinking" before emitting a
+        # token, and a voice turn is a short structured extraction answered from
+        # the caller's own words. `thinkingLevel: low` is accepted by the flash
+        # family (`thinkingBudget` is rejected by flash-lite with HTTP 400), and
+        # measured ~600 ms faster on the same prompt. Only sent where supported.
+        if "flash" in self._model.lower():
+            generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
+
         return {
             "system_instruction": {"parts": [{"text": system_instruction}]},
             "contents": [
@@ -234,12 +248,7 @@ class GeminiLLMProvider:
                     "parts": [{"text": user_text}],
                 }
             ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": request.max_output_tokens,
-                "responseMimeType": "application/json",
-                "responseSchema": response_schema,
-            },
+            "generationConfig": generation_config,
         }
 
     def _system_instruction(self, prompt_version: str) -> str:

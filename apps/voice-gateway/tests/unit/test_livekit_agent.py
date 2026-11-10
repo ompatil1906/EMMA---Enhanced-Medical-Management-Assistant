@@ -376,3 +376,82 @@ def test_seed_livekit_env_keeps_an_explicit_process_override(
     import os
 
     assert os.environ["LIVEKIT_URL"] == "ws://127.0.0.1:9999"
+
+
+@pytest.mark.asyncio
+async def test_caller_audio_published_before_handlers_is_still_attached() -> None:
+    """Regression: caller published before the agent joined → no audio was read.
+
+    The `track_subscribed` event fires during `room.connect()`, before handlers
+    exist. Attachment must be reconciled from room state, not event-only.
+    """
+    from app.integrations.livekit.agent import EmmaAgentSession
+
+    settings = _make_settings()
+    pipeline = MagicMock()
+    pipeline.start = AsyncMock()
+    pipeline.aclose = AsyncMock()
+    pipeline.submit_audio = AsyncMock()
+    pipeline.cancel_tts = AsyncMock()
+    pipeline.should_cancel_for_barge_in = False
+
+    async def _empty_aiter():
+        if False:  # pragma: no cover
+            yield
+
+    pipeline.stream_outbound = _empty_aiter
+
+    class _Publication:
+        sid = "pub-1"
+
+        def __init__(self, track: Any) -> None:
+            self.track = track
+
+    class _Track:
+        sid = "track-1"
+        kind = 1  # KIND_AUDIO
+
+    class _Participant:
+        identity = "emma-caller-abc123"
+
+        def __init__(self, track: Any) -> None:
+            self.track_publications = {"pub-1": _Publication(track)}
+
+    track = _Track()
+    participant = _Participant(track)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.id = "test-session-reconcile"
+    mock_ctx.room = MagicMock()
+    mock_ctx.room.name = "test-room"
+    mock_ctx.room.remote_participants = {participant.identity: participant}
+
+    agent = _patched_agent_factory()
+    with patch("app.integrations.livekit.agent.LiveKitAgent", return_value=agent):
+        session = EmmaAgentSession(ctx=mock_ctx, settings=settings, pipeline=pipeline)
+    session._started = True  # already past start(); handlers attach tracks
+
+    session._setup_room_handlers()
+    await asyncio.sleep(0.05)
+
+    assert "pub-1" in session._attached_sids, "existing caller track must be attached"
+    assert session._input_tasks, "an input loop must be running"
+
+    # A second reconciliation must not attach the same publication twice.
+    before = len(session._attached_sids)
+    session._attach_existing_caller_audio()
+    assert len(session._attached_sids) == before
+
+    await session.stop(reason="test")
+
+
+class _FakeAudioStreamReconcile:
+    def __init__(self, track: Any) -> None:
+        self.track = track
+
+    def __aiter__(self):  # pragma: no cover - no frames in this test
+        return self._gen()
+
+    async def _gen(self):
+        if False:
+            yield None

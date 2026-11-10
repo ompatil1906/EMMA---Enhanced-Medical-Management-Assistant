@@ -47,6 +47,11 @@ the LLM, embeddings, Qdrant, and the backend; on a match it speaks the fixed
   (≤2 sentences). Clinical questions are refused deterministically before any
   model call; practice-specific questions stay on the RAG path and are never
   answered from world knowledge.
+* **Live product (Jira as system of record).** With `CALL_RECORD_SINK=auto`
+  (default) and `JIRA_MODE=live`, the gateway writes Jira directly: a confirmed
+  request creates the issue during the call and the end-of-call summary is
+  appended to it. The NestJS practice API is optional
+  (`CALL_RECORD_SINK=practice_api|both`). Verified live against project `KAN`.
 * **Call records in Jira.** At call end the gateway submits a deterministic
   summary (intake form + narrative + tasks derived from captured requests) to the
   practice API, which stores it and mirrors it to Jira as one issue per call.
@@ -237,6 +242,15 @@ docker compose down
 | `docs/runbooks/final-local-acceptance-testing.md` | acceptance checks |
 | `docs/integrations/exotel-protocol.md` | verified protocol facts vs gateway policy |
 | `docs/integrations/jira.md` | call summary → Jira: endpoints, modes, PII policy, idempotency |
+| `docs/architecture/PIPECAT_FEATURE_GAP_ANALYSIS.md` | Pipecat vs EMMA capability audit |
+| `docs/architecture/EMMA_ADVANCED_VOICE_ARCHITECTURE.md` | layer boundaries, invariants, tunables |
+| `docs/architecture/VOICE_PIPELINE.md` | inbound → turn admission → worker → TTS → outbound |
+| `docs/architecture/INTERRUPTION_AND_TURN_MANAGEMENT.md` | VAD barge-in, cancellation, race guards |
+| `docs/architecture/PROVIDER_INTEGRATION.md` | provider contracts, selection, adding a provider |
+| `docs/testing/VOICE_EVALUATION.md` | suites, measured latencies, unverified list |
+| `docs/operations/VOICE_OBSERVABILITY.md` | metrics, `/api/v1/diagnostics`, content policy |
+| `docs/operations/VOICE_TROUBLESHOOTING.md` | symptom → cause → fix runbook |
+| `docs/implementation/PIPECAT_PORTING_CHANGELOG.md` | what was ported, changed, rejected |
 | `docs/runbooks/local-development.md` | exact commands + troubleshooting |
 | `REQUIREMENTS.md` / `ARCHITECTURE_DECISION_RECORD.md` / `EVALUATION_PLAN.md` / `RISKS_AND_ASSUMPTIONS.md` | Day-1 research |
 

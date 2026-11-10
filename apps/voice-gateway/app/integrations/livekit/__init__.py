@@ -122,33 +122,46 @@ class LiveKitTokenMinter:
         ttl_seconds: int = 3600,
         participant_name: str | None = None,
         caller_first_name: str | None = None,
+        caller: Any = None,
     ) -> str:
         """Mint a LiveKit access token for a browser participant.
 
         The `practice_id` is bound server-side and embedded in the token
         metadata; the browser cannot alter it.
 
-        Day 19: the intake first name (already sanitised by the route) travels in
-        the participant `name` and in the metadata JSON so the agent can greet
-        the caller by name. The participant *identity* stays opaque
-        (`emma-caller-<hex>`) — no PII in identities, room names or logs.
+        Day 19: the intake identity travels in the metadata JSON so the agent
+        can greet the caller by name and fulfill downstream requests.
+        The participant *identity* stays opaque (`emma-caller-<hex>`) — no PII
+        in identities, room names or logs.
 
         Returns a JWT string that the browser passes to `LiveKitClient.connect()`.
         """
         api = self._api()
+        first_name = getattr(caller, "first_name", None) or caller_first_name
+        metadata_dict: dict[str, Any] = {
+            "practice_id": practice_id,
+            "first_name": first_name,
+        }
+        if caller is not None:
+            if getattr(caller, "last_name", None):
+                metadata_dict["last_name"] = caller.last_name
+            if getattr(caller, "email", None):
+                metadata_dict["email"] = caller.email
+            if getattr(caller, "mobile", None):
+                metadata_dict["mobile"] = caller.mobile
+            if getattr(caller, "reason", None):
+                metadata_dict["reason"] = caller.reason
+
         token = (
             api.AccessToken(
                 self._settings.LIVEKIT_API_KEY,
                 self._settings.LIVEKIT_API_SECRET,
             )
             .with_identity(participant_identity)
-            .with_name(participant_name or caller_first_name or "EMMA Caller")
+            .with_name(participant_name or first_name or "EMMA Caller")
             .with_metadata(
                 json.dumps(
-                    {
-                        "practice_id": practice_id,
-                        "first_name": caller_first_name,
-                    },
+                    metadata_dict,
                     separators=(",", ":"),
                 )
             )

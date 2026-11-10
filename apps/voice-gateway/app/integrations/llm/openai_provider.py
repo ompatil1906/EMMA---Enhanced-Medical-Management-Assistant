@@ -125,6 +125,21 @@ _INTENT_EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
+# Exact reply shape for the interpretation call. Models drift when only the
+# prose rules are given (seen live: {"requests":[{"type": …}]} with no `intent`),
+# and OpenAI's strict json_schema mode rejects this model's free-form detail map
+# (HTTP 400), so the shape is pinned in the prompt instead.
+_INTERPRETATION_SHAPE = (
+    '{"intent": "other", "requests": [], "needs_clarification": false, '
+    '"clarification_reason": null}  <- use this when the caller made no request; when '
+    'there IS a request use: {"intent": "<that request_type>", "requests": '
+    '[{"request_type": "<that request_type>", "details": {"preferred_date": null, '
+    '"preferred_time": null, "medication_query": null, "topic": null, '
+    '"reason_as_stated": null}, "missing_fields": [], "source_quotes": []}], '
+    '"needs_clarification": false, "clarification_reason": null}'
+)
+
+
 class OpenAILLMProvider:
     """Real OpenAI provider backed by httpx + the Chat Completions REST API.
 
@@ -338,7 +353,7 @@ class OpenAILLMProvider:
                 f"{request.transcript}"
             )
 
-        return {
+        payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system_instruction},
@@ -348,6 +363,8 @@ class OpenAILLMProvider:
             "max_completion_tokens": request.max_output_tokens,
             "response_format": {"type": "json_object"},
         }
+
+        return payload
 
     def _system_instruction(self, prompt_version: str) -> str:
         return (
@@ -381,6 +398,11 @@ class OpenAILLMProvider:
             "did not say — those are collected by the practice, not by this voice "
             "assistant. Leave `missing_fields` empty; the server decides which "
             "fields are required. "
+            "11) Reply with a JSON object of EXACTLY this shape and no extra keys: "
+            + _INTERPRETATION_SHAPE
+            + ' `intent` MUST equal the request_type of the first request, or "other" '
+            "when there is no request. Never copy the example's words: fill the fields "
+            "from the caller's utterance. "
             f"(prompt version: {prompt_version})"
         )
 

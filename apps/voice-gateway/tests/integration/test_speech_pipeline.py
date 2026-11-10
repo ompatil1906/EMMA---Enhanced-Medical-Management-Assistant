@@ -37,6 +37,10 @@ SPEECH_MODE_PARAMS: dict[str, str] = {
     "LLM_PROVIDER": "mock",
     "EMBEDDING_PROVIDER": "mock",
     "VECTOR_STORE_PROVIDER": "mock",
+    # The repository `.env` may point at a live Jira; tests must never write to
+    # a real board.
+    "JIRA_MODE": "disabled",
+    "CALL_RECORD_SINK": "practice_api",
 }
 
 USER_UTTERANCE = "I would like to book an appointment"

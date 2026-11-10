@@ -33,6 +33,7 @@ export type VoiceMode = "live" | "demo";
 export interface VoiceCaller {
   firstName: string;
   lastName: string;
+  email?: string;
   mobile: string;
   reason: string;
 }

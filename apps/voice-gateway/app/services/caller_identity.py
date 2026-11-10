@@ -27,11 +27,13 @@ from typing import Any
 _MAX_NAME_CHARS = 40
 _MAX_REASON_CHARS = 200
 _MAX_MOBILE_CHARS = 20
+_MAX_EMAIL_CHARS = 100
 
 _NAME_ALLOWED = re.compile(r"[^A-Za-z' -]")
 _NAME_STRIP = re.compile(r"^[^A-Za-z]+|[^A-Za-z]+$")
 _MULTI_SPACE = re.compile(r"\s+")
 _MOBILE_ALLOWED = re.compile(r"[^0-9+ ]")
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
 # Control characters would break TTS phrasing and log/Jira formatting.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
@@ -106,12 +108,21 @@ def normalize_mobile(raw: Any) -> str | None:
     return text
 
 
+def normalize_email(raw: Any) -> str | None:
+    """Validate and lower-case an email address (never spoken, used for records/prescriptions)."""
+    text = _clean_text(raw, max_chars=_MAX_EMAIL_CHARS).lower()
+    if not text or not _EMAIL_RE.match(text):
+        return None
+    return text
+
+
 @dataclass(frozen=True, slots=True)
 class CallerIdentity:
     """One caller's intake record (all fields optional and normalised)."""
 
     first_name: str | None = None
     last_name: str | None = None
+    email: str | None = None
     mobile: str | None = None
     reason: str | None = None
 
@@ -126,7 +137,7 @@ class CallerIdentity:
 
     @property
     def has_any(self) -> bool:
-        return any((self.first_name, self.last_name, self.mobile, self.reason))
+        return any((self.first_name, self.last_name, self.email, self.mobile, self.reason))
 
 
 _EMPTY = CallerIdentity()
@@ -150,6 +161,7 @@ def parse_caller(payload: Any) -> CallerIdentity:
     identity = CallerIdentity(
         first_name=normalize_first_name(pick("first_name", "firstName")),
         last_name=normalize_last_name(pick("last_name", "lastName")),
+        email=normalize_email(pick("email", "email_address", "emailAddress")),
         mobile=normalize_mobile(pick("mobile", "phone")),
         reason=normalize_reason(pick("reason", "reason_for_call", "reasonForCall")),
     )
@@ -186,9 +198,35 @@ def first_name_from_participant(participant: Any) -> str | None:
     return None
 
 
+def caller_from_participant(participant: Any) -> CallerIdentity | None:
+    """Extract a full sanitised `CallerIdentity` from a LiveKit participant."""
+    metadata = getattr(participant, "metadata", None)
+    first_name = normalize_first_name(getattr(participant, "name", None))
+    if not isinstance(metadata, str) or not metadata.strip():
+        return CallerIdentity(first_name=first_name) if first_name else None
+    import json
+
+    try:
+        parsed = json.loads(metadata)
+    except ValueError:
+        return CallerIdentity(first_name=first_name) if first_name else None
+
+    if isinstance(parsed, dict):
+        return CallerIdentity(
+            first_name=first_name or normalize_first_name(parsed.get("first_name")),
+            last_name=normalize_last_name(parsed.get("last_name")),
+            email=normalize_email(parsed.get("email")),
+            mobile=normalize_mobile(parsed.get("mobile")),
+            reason=normalize_reason(parsed.get("reason")),
+        )
+    return CallerIdentity(first_name=first_name) if first_name else None
+
+
 __all__ = [
     "CallerIdentity",
+    "caller_from_participant",
     "first_name_from_participant",
+    "normalize_email",
     "normalize_first_name",
     "normalize_last_name",
     "normalize_mobile",

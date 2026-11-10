@@ -4,6 +4,11 @@ Correlation-first design: every record carries session_id + call_sid +
 practice_id and provider names/rates. Timings are monotonic deltas in
 milliseconds. CONTENT POLICY (assignment §13): no transcript text, no audio
 payloads, no secrets — counts/lengths only.
+
+Day 20 adds the latency breakdown Pipecat reports per turn: time from the final
+transcript to the first synthesised audio chunk, LLM time, TTS time, the
+user-visible response latency, and interruption latency. Those numbers are what
+`/api/v1/diagnostics` aggregates (p50/p95 over recent sessions).
 """
 
 from __future__ import annotations
@@ -53,6 +58,35 @@ class SessionMetrics:
         self.state_transitions: int = 0
         self.practice_api: dict[str, Any] = {"outcomes": []}
         self.errors: list[str] = []
+        # Day 20: turn assembly / interruption / latency breakdown.
+        self.turns: dict[str, Any] = {
+            "dropped": 0,
+            "dropped_reasons": {},
+            "held": 0,
+            "interrupted": 0,
+            "interrupted_speech": 0,
+            "interruption_latency_ms": [],
+        }
+        self.latency: dict[str, Any] = {
+            "final_to_processing_ms": [],
+            "processing_to_first_audio_ms": [],
+            "turn_total_ms": [],  # mirrored into processing.turn_total_ms
+            "llm_ms": [],
+            "tts_ms": [],
+        }
+        self.vad: dict[str, Any] = {
+            "speech_starts": 0,
+            "speech_ends": 0,
+            "speech_ms": [],
+            "early_barge_ins": 0,
+            "barge_in_latency_ms": [],
+        }
+        self._final_at: float | None = None
+        self._speech_started_at: float | None = None
+        self._llm_started: float | None = None
+        self._llm_ms: float | None = None
+        self._tts_started: float | None = None
+        self._first_audio_at: float | None = None
 
     # --- lifecycle stamps ---------------------------------------------------------
 
@@ -77,22 +111,80 @@ class SessionMetrics:
     def note_empty_final(self) -> None:
         self.stt["empty_finals"] += 1
 
+    def note_final_received(self) -> None:
+        """Stamp the moment a final transcript was admitted (turn clock origin)."""
+        self._final_at = time.monotonic()
+
     def note_processing_started(self) -> None:
         if self.processing["started_at_ms"] is None:
             self.processing["started_at_ms"] = self._elapsed_ms()
-        self.processing["_turn_started"] = time.monotonic()
+        now = time.monotonic()
+        self.processing["_turn_started"] = now
+        if self._final_at is not None:
+            self.latency["final_to_processing_ms"].append(round((now - self._final_at) * 1000.0, 1))
+
+    def note_llm_started(self) -> None:
+        self._llm_started = time.monotonic()
+
+    def note_llm_completed(self) -> None:
+        if self._llm_started is not None:
+            self._llm_ms = round((time.monotonic() - self._llm_started) * 1000.0, 1)
+            self.latency["llm_ms"].append(self._llm_ms)
+            self._llm_started = None
 
     def note_turn_complete(self) -> None:
         turn_started = self.processing.get("_turn_started")
         if turn_started is not None:
-            self.processing["turn_total_ms"].append(
-                round((time.monotonic() - turn_started) * 1000.0, 1)
-            )
+            total = round((time.monotonic() - turn_started) * 1000.0, 1)
+            self.processing["turn_total_ms"].append(total)
+            self.latency["turn_total_ms"].append(total)
             self.processing.pop("_turn_started", None)
+        self._final_at = None
+        self._llm_started = None
+        self._llm_ms = None
+        self._tts_started = None
+        self._first_audio_at = None
+
+    # --- Day 20: VAD -------------------------------------------------------------
+
+    def note_speech_started(self, *, energy_db: float | None = None) -> None:
+        self.vad["speech_starts"] += 1
+        self._speech_started_at = time.monotonic()
+
+    def note_speech_ended(self, *, speech_ms: int = 0) -> None:
+        self.vad["speech_ends"] += 1
+        if speech_ms > 0:
+            self.vad["speech_ms"].append(speech_ms)
+
+    def note_early_barge_in(self) -> None:
+        """Assistant playback cancelled from VAD (before the STT final)."""
+        self.vad["early_barge_ins"] += 1
+        if self._speech_started_at is not None:
+            latency = (time.monotonic() - self._speech_started_at) * 1000.0
+            self.vad["barge_in_latency_ms"].append(round(latency, 1))
+            self._speech_started_at = None
+
+    # --- Day 20: turn assembly / interruption ------------------------------------
+
+    def note_turn_dropped(self, reason: str) -> None:
+        self.turns["dropped"] += 1
+        reasons = self.turns["dropped_reasons"]
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+    def note_turn_held(self, reason: str) -> None:
+        self.turns["held"] += 1
+
+    def note_interrupted_speech(self) -> None:
+        self.turns["interrupted_speech"] += 1
+
+    def note_interruption(self, latency_ms: float) -> None:
+        self.turns["interrupted"] += 1
+        self.turns["interruption_latency_ms"].append(round(latency_ms, 1))
 
     def note_tts_started(self, provider: str) -> None:
         self.providers["tts"] = provider
         self.tts["started_at_ms"] = self._elapsed_ms()
+        self._tts_started = time.monotonic()
 
     def note_tts_chunk(self, payload_bytes: int) -> None:
         now = self._elapsed_ms()
@@ -100,6 +192,18 @@ class SessionMetrics:
             self.tts["first_chunk_ms"] = now
         self.tts["chunks"] += 1
         self.tts["bytes"] += payload_bytes
+        # First audible audio for this turn → user-visible latency stamps.
+        if self._first_audio_at is None:
+            self._first_audio_at = time.monotonic()
+            if self._tts_started is not None:
+                self.latency["tts_ms"].append(
+                    round((self._first_audio_at - self._tts_started) * 1000.0, 1)
+                )
+            turn_started = self.processing.get("_turn_started")
+            if turn_started is not None:
+                self.latency["processing_to_first_audio_ms"].append(
+                    round((self._first_audio_at - turn_started) * 1000.0, 1)
+                )
 
     def note_tts_completed(self) -> None:
         self.tts["completed_ms"] = self._elapsed_ms()
@@ -158,6 +262,8 @@ class SessionMetrics:
             "state_transitions": self.state_transitions,
             "practice_api": self.practice_api,
             "errors": self.errors,
+            "turns": self.turns,
+            "latency": self.latency,
         }
 
     def emit(self) -> dict[str, Any]:

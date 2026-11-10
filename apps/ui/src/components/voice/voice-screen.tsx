@@ -29,7 +29,19 @@ const GATEWAY_URL =
 const VOICE_TRANSPORT =
   process.env.NEXT_PUBLIC_VOICE_TRANSPORT ?? "websocket";
 
-const LIVEKIT_ROOM_NAME = "emma-voice";
+/* LiveKit dispatches one agent job per ROOM. Reusing a fixed room name meant
+   every call after the first joined a room that already had (or had had) an
+   agent and was never dispatched again — the caller sat on "Listening" with no
+   assistant. Each call now gets its own room (also a session-isolation win). */
+const LIVEKIT_ROOM_PREFIX = "emma-voice";
+
+function newRoomName(): string {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+      : Math.random().toString(36).slice(2, 14);
+  return `${LIVEKIT_ROOM_PREFIX}-${suffix}`;
+}
 
 const LEVEL_INTERVAL_MS = 80;
 
@@ -51,6 +63,7 @@ export function VoiceScreen() {
   const [callerData, setCallerData] = useState<IntakeFormData>({
     firstName: "",
     lastName: "",
+    email: "",
     mobile: "",
     reason: "Book Appointment",
   });
@@ -183,7 +196,7 @@ export function VoiceScreen() {
       if (VOICE_TRANSPORT === "livekit") {
         transport = createLiveKitTransport({
           baseUrl: GATEWAY_URL.replace(/^ws/, "http").replace(/^wss/, "https"),
-          roomName: LIVEKIT_ROOM_NAME,
+          roomName: newRoomName(),
           caller,
         });
       } else {

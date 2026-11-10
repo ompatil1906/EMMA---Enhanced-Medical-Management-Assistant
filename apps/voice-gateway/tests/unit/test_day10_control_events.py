@@ -24,6 +24,17 @@ from tests.evaluation.day9 import close, drain_outbound, make_pipeline
 SESSION_ID = "day10-control-events"
 
 
+async def _feed(pipeline, event):
+    """Feed one STT event and wait for the conversation worker to finish.
+
+    Day 20 decoupled STT consumption from turn processing so a new utterance can
+    interrupt an in-flight turn; tests therefore synchronise explicitly instead
+    of relying on `_handle_stt_event` returning after the turn.
+    """
+    await pipeline._handle_stt_event(event)
+    await pipeline.wait_for_turn_idle()
+
+
 def _controls(pipeline) -> list[dict[str, object]]:
     payloads: list[dict[str, object]] = []
     while not pipeline._outbound_queue.empty():
@@ -103,24 +114,26 @@ async def test_partial_and_final_transcripts_are_emitted_once() -> None:
         drain_outbound(harness)
         session_id = pipeline.session.session_id
 
-        await pipeline._handle_stt_event(
+        await _feed(
+            pipeline,
             PartialTranscript(
                 session_id=session_id,
                 provider="eval-stt",
                 sequence=1,
                 text="i would like",
                 confidence=0.4,
-            )
+            ),
         )
         # Emergency text short-circuits before the LLM, so this needs no script.
-        await pipeline._handle_stt_event(
+        await _feed(
+            pipeline,
             FinalTranscript(
                 session_id=session_id,
                 provider="eval-stt",
                 sequence=2,
                 text="I am having severe chest pain",
                 confidence=0.99,
-            )
+            ),
         )
 
         controls = _controls(pipeline)

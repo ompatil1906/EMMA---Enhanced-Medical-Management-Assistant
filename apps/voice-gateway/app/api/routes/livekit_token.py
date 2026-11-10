@@ -44,6 +44,7 @@ class CallerDto(BaseModel):
 
     firstName: str | None = Field(default=None, max_length=80)
     lastName: str | None = Field(default=None, max_length=80)
+    email: str | None = Field(default=None, max_length=120)
     mobile: str | None = Field(default=None, max_length=40)
     reason: str | None = Field(default=None, max_length=300)
 
@@ -108,6 +109,7 @@ async def mint_token(request: TokenRequest) -> TokenResponse:
         practice_id=practice_id,
         ttl_seconds=3600,
         caller_first_name=caller.first_name,
+        caller=caller,
     )
 
     return TokenResponse(

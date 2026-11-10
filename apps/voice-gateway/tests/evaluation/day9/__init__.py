@@ -239,6 +239,9 @@ def eval_settings(**overrides: object) -> Settings:
         "PRACTICE_API_TIMEOUT": 1.0,
         "RETRIEVAL_TOP_K": 5,
         "RETRIEVAL_MIN_SCORE": 0.0,
+        # Tests must never touch a live task platform from the developer's .env.
+        "JIRA_MODE": "disabled",
+        "CALL_RECORD_SINK": "practice_api",
     }
     values.update(overrides)
     return Settings(**values)
@@ -348,6 +351,10 @@ async def run_turn(
         confidence=confidence,
     )
     await harness.pipeline._handle_stt_event(event)
+    # Day 20: finals are admitted to the conversation worker instead of being
+    # processed inline, so tests must wait for the worker to drain before
+    # asserting state (this is also the production shutdown contract).
+    await harness.pipeline.wait_for_turn_idle()
     drain_outbound(harness)
 
 

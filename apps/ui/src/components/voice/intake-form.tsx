@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { PhoneCall, User, Phone, ShieldCheck, CalendarCheck } from "lucide-react";
+import { PhoneCall, User, Phone, Mail, ShieldCheck, CalendarCheck } from "lucide-react";
 
 export interface IntakeFormData {
   firstName: string;
   lastName: string;
+  email: string;
   mobile: string;
   reason: string;
 }
@@ -25,6 +26,7 @@ export function IntakeForm({ onCallNow }: IntakeFormProps) {
   const [form, setForm] = useState<IntakeFormData>({
     firstName: "",
     lastName: "",
+    email: "",
     mobile: "",
     reason: "Book Appointment",
   });
@@ -35,6 +37,8 @@ export function IntakeForm({ onCallNow }: IntakeFormProps) {
     const e: Partial<IntakeFormData> = {};
     if (!form.firstName.trim()) e.firstName = "First name required";
     if (!form.lastName.trim()) e.lastName = "Last name required";
+    if (!form.email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim()))
+      e.email = "Valid email required";
     if (!/^\+?[\d\s\-()]{7,16}$/.test(form.mobile.trim()))
       e.mobile = "Valid phone required";
     if (!form.reason.trim()) e.reason = "Reason required";
@@ -103,6 +107,25 @@ export function IntakeForm({ onCallNow }: IntakeFormProps) {
                 }`}
             />
           </div>
+        </div>
+
+        {/* Email Address Field */}
+        <div className="flex flex-col gap-1">
+          <label className="flex items-center gap-1 text-[9.5px] font-medium uppercase tracking-wider text-white/45">
+            <Mail className="h-2.5 w-2.5" /> Email Address
+          </label>
+          <input
+            type="email"
+            value={form.email}
+            onChange={(e) => {
+              setForm((f) => ({ ...f, email: e.target.value.trim() }));
+              if (errors.email) setErrors((e) => ({ ...e, email: undefined }));
+            }}
+            placeholder="sarah.jenkins@example.com"
+            className={`w-full rounded-xl border bg-white/[0.04] px-3 py-2 text-[11px] text-white placeholder-white/20 outline-none transition focus:border-white/30 focus:bg-white/[0.08] ${
+              errors.email ? "border-red-500/50" : "border-white/10"
+            }`}
+          />
         </div>
 
         {/* Mobile Number Field */}

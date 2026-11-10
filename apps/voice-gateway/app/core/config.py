@@ -150,6 +150,58 @@ class Settings(BaseSettings):
     GENERAL_CHAT_ENABLED: bool = True
     GENERAL_CHAT_MAX_SENTENCES: int = Field(default=2, ge=1, le=3)
 
+    # --- Day 20: direct Jira sink (live product) ------------------------------
+    # The gateway owns the record when CALL_RECORD_SINK=jira|both. `mock` is the
+    # offline/demo mode (deterministic issue key, no network); `live` targets
+    # Atlassian Cloud REST v3 and refuses to send unless fully configured.
+    JIRA_MODE: Literal["disabled", "mock", "live"] = "disabled"
+    JIRA_BASE_URL: str | None = None
+    JIRA_EMAIL: str | None = None
+    JIRA_API_TOKEN: str | None = None
+    JIRA_PROJECT_KEY: str | None = None
+    JIRA_ISSUE_TYPE_MAP: str | None = None  # "appointment-request:Appointment,..."
+    JIRA_EPIC_KEY: str | None = None
+    JIRA_PII_MODE: Literal["full", "masked", "none"] = "masked"
+    JIRA_TIMEOUT_MS: int = Field(default=5000, ge=500, le=30_000)
+
+    # --- Day 20: bounded LLM context -----------------------------------------
+    # The model sees request state plus a bounded slice of recent dialogue; long
+    # calls collapse older turns into a deterministic digest. Keeps token cost
+    # and latency flat as a call gets longer.
+    LLM_CONTEXT_MAX_CHARS: int = Field(default=1400, ge=200, le=8000)
+    LLM_CONTEXT_RECENT_TURNS: int = Field(default=8, ge=0, le=40)
+    # Opt-in: also send a bounded recent-dialogue slice (default OFF — Day 9
+    # pins that the transcript is never replayed to the model).
+    LLM_CONTEXT_INCLUDE_DIALOGUE: bool = False
+
+    # --- Day 20: audio-level voice activity detection (VAD) -------------------
+    # Local, dependency-free energy VAD over decoded PCM frames. It provides the
+    # speech-start signal used for immediate barge-in (before an STT final
+    # arrives) and the speech-end signal used for turn/latency metrics.
+    VAD_ENABLED: bool = True
+    # Cancel assistant playback the moment the caller is detected speaking.
+    VAD_BARGE_IN_ENABLED: bool = True
+    VAD_START_ENERGY_DB: float = Field(default=-35.0, ge=-80.0, le=-5.0)
+    VAD_END_ENERGY_DB: float = Field(default=-45.0, ge=-90.0, le=-10.0)
+    VAD_MIN_SPEECH_MS: int = Field(default=180, ge=20, le=2000)
+    VAD_END_SILENCE_MS: int = Field(default=450, ge=100, le=5000)
+    # Extra loudness required while EMMA is speaking (acoustic echo guard).
+    VAD_ECHO_GUARD_DB: float = Field(default=6.0, ge=0.0, le=30.0)
+
+    # --- Day 20: turn assembly + interruption --------------------------------
+    # Deterministic turn-stop policy between streaming STT and the controller.
+    # Holds only apply when STT partials show the caller is still talking, so
+    # single-shot transports keep their existing latency.
+    TURN_ASSEMBLY_ENABLED: bool = True
+    TURN_HOLD_MS: int = Field(default=700, ge=100, le=5000)
+    TURN_MERGE_WINDOW_MS: int = Field(default=2500, ge=0, le=10_000)
+    TURN_MAX_HOLD_MS: int = Field(default=4000, ge=500, le=15_000)
+    TURN_DEDUPE_WINDOW_MS: int = Field(default=2000, ge=0, le=10_000)
+    TURN_PARTIAL_FRESHNESS_MS: int = Field(default=2000, ge=0, le=10_000)
+    # A new final cancels the in-flight turn (LLM/TTS) instead of queueing
+    # behind it — the core barge-in-during-processing behaviour.
+    TURN_INTERRUPT_ENABLED: bool = True
+
     # --- Day 19: call summary + external task platforms ---------------------
     # Deterministic summary built from the conversation state at call end and
     # submitted to the practice backend (which mirrors it to Jira). Opt-out.
@@ -161,6 +213,17 @@ class Settings(BaseSettings):
     CALL_SUMMARY_INCLUDE_TRANSCRIPT: bool = False
     # Hard ceiling on how long the end-of-call summary may delay teardown.
     CALL_SUMMARY_TIMEOUT: float = Field(default=2.0, gt=0, le=10.0)
+
+    # --- Day 20: where the call record goes (live product) -------------------
+    # auto         : Jira when JIRA_MODE is configured (live product), else the
+    #                practice API when it is configured, else nothing
+    # practice_api : POST /api/v1/calls/:id/summary to the NestJS backend
+    #                (prototype deployment; backend mirrors to Jira)
+    # jira         : the gateway writes the Jira issue directly (live product,
+    #                no prototype backend required)
+    # both         : practice API first, then Jira
+    # none         : keep the summary in logs/metrics only
+    CALL_RECORD_SINK: Literal["auto", "practice_api", "jira", "both", "none"] = "auto"
 
     # --- Day 5: LLM conversation engine -------------------------------------
     LLM_MODEL: str = "gemini-3.8-flash"

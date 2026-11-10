@@ -4,6 +4,28 @@
 is implemented against the documented REST v3 API and is **not** exercised in
 this environment (no credentials). Prototype only — no real patient data.
 
+## 0. Two deployment shapes
+
+| Shape | `CALL_RECORD_SINK` | System of record | Practice API needed |
+|---|---|---|---|
+| **Live product** (default) | `auto` → `jira` | Jira | **no** |
+| Prototype | `practice_api` | NestJS practice API (mirrors to Jira) | yes |
+| Dual-write | `both` | both | yes |
+
+In the live-product shape the **voice gateway** writes Jira directly
+(`app/integrations/jira_client.py`): a confirmed appointment/prescription request
+creates the issue during the call, and the end-of-call summary is appended as a
+comment to that same issue. No prototype backend is deployed or required.
+
+```
+browser form ─► gateway ─► ConversationController (confirmation)
+                              └─ tool: create_appointment_request ─► Jira issue (KAN-n)
+                       └─ end of call: summary + tasks ─► comment on the same issue
+```
+
+Verified live against project `KAN` (one synthetic connectivity issue created
+during acceptance; safe to delete).
+
 ## 1. What it does
 
 Every completed call produces one deterministic record:
@@ -26,7 +48,27 @@ browser form ─► gateway (greeting + conversation)
               practice API ──► Jira REST v3 POST /rest/api/3/issue
 ```
 
-## 2. Endpoints
+## 2. Gateway-direct configuration (live product)
+
+Gateway (`apps/voice-gateway/.env`):
+
+```bash
+CALL_RECORD_SINK=auto          # Jira when configured
+JIRA_MODE=live                 # disabled | mock | live
+JIRA_BASE_URL=https://<site>.atlassian.net
+JIRA_EMAIL=<account email>
+JIRA_API_TOKEN=<token>         # ignored .env only
+JIRA_PROJECT_KEY=KAN
+JIRA_ISSUE_TYPE_MAP=appointment-request:Task,prescription-request:Task
+JIRA_PII_MODE=masked           # masked | full | none
+PRACTICE_API_BASE_URL=         # empty → practice API not used
+```
+
+`GET /api/v1/diagnostics` reports `call_record.jira = { mode, configured,
+project_key, pii_mode }` and `call_record.practice_api_configured` — never
+credentials.
+
+## 2b. Practice-API endpoints (prototype shape)
 
 | Method | Path | Purpose |
 |---|---|---|

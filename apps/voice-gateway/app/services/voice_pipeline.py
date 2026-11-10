@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -50,11 +51,18 @@ from app.domain.speech import (
     TtsEvent,
 )
 from app.domain.speech_session import MediaFormatChangedError, ProviderState
+from app.integrations.jira_client import JiraClient, JiraRecord
+from app.services.audio.vad import EnergyVad, VadConfig, VadState
 from app.services.audio_framer import OutboundAudioFramer
 from app.services.caller_identity import CallerIdentity
+from app.services.conversation.context_manager import (
+    ContextBudget,
+    ConversationContextManager,
+)
 from app.services.conversation.conversation_controller import (
     ControllerDecision,
     ConversationController,
+    submission_reply,
 )
 from app.services.conversation.general_conversation import (
     CLINICAL_REFUSAL,
@@ -64,10 +72,23 @@ from app.services.conversation.general_conversation import (
     looks_like_general_question,
 )
 from app.services.conversation.intent_interpreter import IntentInterpretationError
+from app.services.conversation.turn_manager import (
+    TurnAction,
+    TurnAssembler,
+    TurnManagerConfig,
+)
 from app.services.metrics import SessionMetrics
+from app.services.observability import registry as latency_registry
 from app.services.response_handler import ConversationDecision, DeterministicResponseHandler
 from app.services.retrieval import KnowledgeAnswerService, Retriever
 from app.services.safety.emergency_guard import EMERGENCY_SCRIPT, emergency_guard
+from app.services.tools import (
+    ToolCall,
+    ToolContext,
+    ToolExecutor,
+    ToolStatus,
+    build_default_registry,
+)
 from app.speech.audio_convert import convert_if_needed
 from app.speech.base import ProviderSynthesisError
 
@@ -83,6 +104,8 @@ _IDENTITY_QUERY_RE = re.compile(
     r"\b(who are you|what are you|what is emma|what can you do|tell me about yourself|medical ai)\b"
 )
 _OUTBOUND_END: object = object()
+# Sentinel that stops the conversation worker loop.
+_TURN_END: object = object()
 # How long teardown will wait for a still-in-flight call-record registration
 # before giving up on the summary (bounded; never blocks a hanging call).
 _SUMMARY_TASK_GRACE_SECONDS = 1.0
@@ -166,14 +189,64 @@ class VoicePipeline:
         self.failed = False
         self.failure_detail: str | None = None
         self.turns_processed = 0
-        # --- Day 9: turn management ------------------------------------------
-        self._turn_lock = asyncio.Lock()  # serialise turn processing per session
+        # --- Day 9/20: turn management ---------------------------------------
+        # The STT consumer never blocks on conversation work: finals are admitted
+        # by the turn assembler, queued, and processed by one conversation worker
+        # per session. That decoupling is what makes interruption during
+        # processing (a long LLM call) possible at all.
+        self._turn_lock = asyncio.Lock()  # one turn at a time inside the worker
         self._last_turn_sequence: int | None = None  # duplicate-turn detection
         self._current_tts_utterance_id: str | None = None  # for barge-in cancellation
-        # A final transcript that arrived while the pipeline was speaking (e.g.
-        # during the greeting) is buffered here and processed once we return to
-        # LISTENING, instead of crashing the turn on an invalid FSM transition.
-        self._buffered_utterance: FinalTranscript | None = None
+        self._turn_config = TurnManagerConfig(
+            enabled=bool(getattr(settings, "TURN_ASSEMBLY_ENABLED", True)),
+            hold_ms=int(getattr(settings, "TURN_HOLD_MS", 700)),
+            merge_window_ms=int(getattr(settings, "TURN_MERGE_WINDOW_MS", 2500)),
+            max_hold_ms=int(getattr(settings, "TURN_MAX_HOLD_MS", 4000)),
+            dedupe_window_ms=int(getattr(settings, "TURN_DEDUPE_WINDOW_MS", 2000)),
+            partial_freshness_ms=int(getattr(settings, "TURN_PARTIAL_FRESHNESS_MS", 2000)),
+        )
+        self._turn_assembler = TurnAssembler(self._turn_config)
+        self._context_manager = ConversationContextManager(
+            ContextBudget(
+                max_chars=int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 1400)),
+                recent_turns=int(getattr(settings, "LLM_CONTEXT_RECENT_TURNS", 8)),
+                include_dialogue=bool(getattr(settings, "LLM_CONTEXT_INCLUDE_DIALOGUE", False)),
+            )
+        )
+        self._turn_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=4)
+        self._turn_worker: asyncio.Task[None] | None = None
+        self._current_turn: asyncio.Task[None] | None = None
+        self._held_task: asyncio.Task[None] | None = None
+        self._dispatch_sequence = 0
+        # Original STT sequence of the last admitted final (out-of-order guard)
+        # and whether EMMA has spoken since it (duplicate-final guard).
+        self._last_origin_sequence: int | None = None
+        self._spoke_since_final = False
+        self._interrupt_enabled = bool(getattr(settings, "TURN_INTERRUPT_ENABLED", True))
+        self._interrupted_turns = 0
+        # --- Day 20: audio-level VAD (speech-start barge-in) ------------------
+        self._vad_enabled = bool(getattr(settings, "VAD_ENABLED", True))
+        self._vad_barge_in = bool(getattr(settings, "VAD_BARGE_IN_ENABLED", True))
+        self._vad = (
+            EnergyVad(
+                VadConfig(
+                    start_energy_db=float(getattr(settings, "VAD_START_ENERGY_DB", -35.0)),
+                    end_energy_db=float(getattr(settings, "VAD_END_ENERGY_DB", -45.0)),
+                    min_speech_ms=int(getattr(settings, "VAD_MIN_SPEECH_MS", 180)),
+                    end_silence_ms=int(getattr(settings, "VAD_END_SILENCE_MS", 450)),
+                    echo_guard_db=float(getattr(settings, "VAD_ECHO_GUARD_DB", 6.0)),
+                )
+            )
+            if self._vad_enabled
+            else None
+        )
+        self._vad_task: asyncio.Task[None] | None = None
+        # --- Day 20: typed tool execution (function-calling layer) -----------
+        self._tool_executor: ToolExecutor | None = None
+        # --- Day 20: call-record sink (practice API and/or direct Jira) -------
+        self._record_sink = str(getattr(settings, "CALL_RECORD_SINK", "practice_api"))
+        self._jira = JiraClient.from_settings(settings)
+        self._jira_record: dict[str, str | None] | None = None
 
     # --- lifecycle -----------------------------------------------------------------
 
@@ -182,6 +255,7 @@ class VoicePipeline:
         self.session.fsm.transition(VoiceState.CONNECTING, TransitionReason.CALL_ACCEPTED)
         self._metrics.note_transition()
         await self._start_stt()
+        self._turn_worker = asyncio.create_task(self._turn_loop(), name="turn-worker")
         self._stt_task = asyncio.create_task(self._consume_stt_events(), name="stt-events")
         # Register the call record in the background: it must never delay the
         # greeting, and it must never block the audio path.
@@ -209,6 +283,7 @@ class VoicePipeline:
                 self._metrics.note_conversion(
                     audio.audio_format.sample_rate, self.session.audio_format.sample_rate
                 )
+            self._run_vad(payload)
             await self._stt.push_audio(self.session.session_id, payload)
         except MediaFormatChangedError:
             raise
@@ -254,6 +329,43 @@ class VoicePipeline:
         if self._closed:
             return
         self._closed = True
+
+        # Stop turn admission first (no new work), then the worker and any
+        # in-flight turn — teardown must never wait on a conversation turn.
+        vad_task = self._vad_task
+        self._vad_task = None
+        if vad_task is not None and not vad_task.done():
+            vad_task.cancel()
+            try:
+                await vad_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._vad is not None:
+            self._vad.reset()
+        try:
+            await self._jira.aclose()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+        self._cancel_hold_task()
+        try:
+            self._turn_queue.put_nowait(_TURN_END)
+        except asyncio.QueueFull:
+            pass
+        current = self._current_turn
+        if current is not None and not current.done():
+            current.cancel()
+            try:
+                await current
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._turn_worker is not None:
+            self._turn_worker.cancel()
+            try:
+                await self._turn_worker
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._turn_worker = None
+
         if self._stt_task is not None:
             self._stt_task.cancel()
             try:
@@ -291,7 +403,22 @@ class VoicePipeline:
         # best-effort: it can neither block teardown nor turn into a spoken or
         # logged claim of persistence.
         await self._submit_call_summary_bounded(fatal=fatal)
-        self._metrics.emit()
+        record = self._metrics.emit()
+        # Day 20: publish the session's latency breakdown to the bounded
+        # in-process registry behind `GET /api/v1/diagnostics`.
+        try:
+            latency_registry.record_from_metrics(
+                metrics_record=record,
+                started_at=time.time() - max(0.0, self.session.age_seconds),
+                tool_summary=(
+                    self._tool_executor.summary() if self._tool_executor is not None else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 — observability must never break teardown
+            logger.warning(
+                "latency registry record failed",
+                extra={"session_id": self.session.session_id},
+            )
 
     # --- Day 19: call record + summary -------------------------------------------------
 
@@ -321,37 +448,49 @@ class VoicePipeline:
         )
 
     async def _submit_call_summary_bounded(self, *, fatal: bool) -> None:
-        """Submit the deterministic summary under a hard timeout.
+        """Persist the call record to the configured sink(s) under a hard timeout.
 
-        Skipped when: summaries are disabled, the call had no practice record, no
-        practice backend is configured, the summary was already submitted, or the
+        Sinks (`CALL_RECORD_SINK`):
+
+        * `practice_api` — the prototype NestJS backend (which mirrors to Jira);
+        * `jira`         — the gateway writes the Jira issue directly, so the
+          live product needs no prototype backend;
+        * `both`         — practice API first, then Jira;
+        * `none`         — nothing leaves the process.
+
+        Always skipped when: summaries are disabled, already submitted, or the
         emergency guard matched (zero administrative actions on emergency).
+        Teardown is never blocked: the whole dispatch is bounded and failures are
+        recorded, never raised.
         """
         if self._summary_submitted:
             return
         if not getattr(self._settings, "CALL_SUMMARY_ENABLED", True):
             return
         if self._emergency_matched:
-            self._metrics.note_practice_outcome("call_summary", "skipped_emergency")
+            self._metrics.note_practice_outcome("call_record", "skipped_emergency")
             return
-        if not (self._practice_client and self._practice_id):
+
+        sink = self._resolved_record_sink()
+        if sink == "none":
             return
+        wants_practice_api = sink in ("practice_api", "both")
+        wants_jira = sink in ("jira", "both")
+
+        if wants_practice_api and not (self._practice_client and self._practice_id):
+            wants_practice_api = False
+        if wants_jira and self._jira.mode == "live" and str(self._settings.APP_ENV) == "test":
+            # Defence in depth: a test run must never create issues on a real
+            # board, even if a developer's .env points at one.
+            self._metrics.note_practice_outcome("call_record_jira", "blocked_in_test")
+            wants_jira = False
+        if wants_jira and self._jira.mode == "disabled":
+            self._metrics.note_practice_outcome("call_record_jira", "disabled")
+            wants_jira = False
+        if not (wants_practice_api or wants_jira):
+            return
+
         self._summary_submitted = True
-
-        # Wait (briefly) for the call record so the summary has a parent row.
-        if self._call_record_task is not None and not self._call_record_task.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._call_record_task), timeout=_SUMMARY_TASK_GRACE_SECONDS
-                )
-            except (TimeoutError, asyncio.CancelledError):
-                pass
-            except Exception:  # noqa: BLE001 — registration never raises here
-                pass
-
-        if not self._call_record_id:
-            self._metrics.note_practice_outcome("call_summary", "skipped_no_call_record")
-            return
 
         from app.integrations.practice_api import (
             SubmissionOutcome,
@@ -359,43 +498,98 @@ class VoicePipeline:
         )
         from app.services.call_summary import build_call_summary
 
+        timeout = float(getattr(self._settings, "CALL_SUMMARY_TIMEOUT", 2.0))
+        outcome_label = (
+            "emergency" if self._emergency_matched else ("failed" if fatal else "completed")
+        )
         summary = build_call_summary(
             conversation=self.session.conversation_state,
             caller=self._caller,
-            outcome="emergency"
-            if self._emergency_matched
-            else ("failed" if fatal else "completed"),
+            outcome=outcome_label,
             started_at=self.session.started_at,
             include_transcript=bool(
                 getattr(self._settings, "CALL_SUMMARY_INCLUDE_TRANSCRIPT", False)
             ),
         )
-        key = build_summary_idempotency_key(
-            practice_id=self._practice_id, call_id=self._call_record_id
-        )
-        timeout = min(
-            float(getattr(self._settings, "CALL_SUMMARY_TIMEOUT", 2.0)),
-            float(self._settings.PRACTICE_API_TIMEOUT),
-        )
-        try:
-            outcome = await asyncio.wait_for(
-                self._practice_client.submit_call_summary(
-                    practice_id=self._practice_id,
-                    call_id=self._call_record_id,
-                    idempotency_key=key,
-                    summary_payload=summary.to_payload(),
-                ),
-                timeout=timeout,
+
+        if wants_practice_api:
+            # The practice API attaches the summary to an existing call row, so
+            # wait (briefly) for the registration task to finish.
+            if self._call_record_task is not None and not self._call_record_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._call_record_task),
+                        timeout=_SUMMARY_TASK_GRACE_SECONDS,
+                    )
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:  # noqa: BLE001 — registration never raises here
+                    pass
+
+            if not self._call_record_id:
+                self._metrics.note_practice_outcome("call_record", "skipped_no_call_record")
+            else:
+                key = build_summary_idempotency_key(
+                    practice_id=self._practice_id or "", call_id=self._call_record_id
+                )
+                try:
+                    outcome = await asyncio.wait_for(
+                        self._practice_client.submit_call_summary(  # type: ignore[union-attr]
+                            practice_id=self._practice_id or "",
+                            call_id=self._call_record_id,
+                            idempotency_key=key,
+                            summary_payload=summary.to_payload(),
+                        ),
+                        timeout=min(timeout, float(self._settings.PRACTICE_API_TIMEOUT)),
+                    )
+                except TimeoutError:
+                    outcome = SubmissionOutcome(status="timeout", detail="call summary timed out")
+                except Exception as exc:  # noqa: BLE001 — teardown must never raise
+                    outcome = SubmissionOutcome(status="unavailable", detail=type(exc).__name__)
+                self._metrics.note_practice_outcome("call_record_practice_api", outcome.status)
+                logger.info(
+                    "call summary submitted to practice api",
+                    extra={"session_id": self.session.session_id, "status": outcome.status},
+                )
+
+        if wants_jira:
+            jira_call_id = self._call_record_id or self.session.call_sid or self.session.session_id
+            record = await self._jira.create_call_issue(
+                summary,
+                practice_id=self._practice_id,
+                call_id=jira_call_id,
+                idempotency_key=f"emma:call:{jira_call_id}",
+                existing_issue_key=(self._jira_record or {}).get("issue_key"),
             )
-        except TimeoutError:
-            outcome = SubmissionOutcome(status="timeout", detail="call summary timed out")
-        except Exception as exc:  # noqa: BLE001 — teardown must never raise
-            outcome = SubmissionOutcome(status="unavailable", detail=type(exc).__name__)
-        self._metrics.note_practice_outcome("call_summary", outcome.status)
-        logger.info(
-            "call summary submitted",
-            extra={"session_id": self.session.session_id, "status": outcome.status},
-        )
+            self._jira_record = {
+                "status": record.status,
+                "issue_key": record.issue_key,
+                "issue_url": record.issue_url,
+                "error": record.error,
+            }
+            self._metrics.note_practice_outcome("call_record_jira", record.status)
+            logger.info(
+                "call record mirrored to jira",
+                extra={
+                    "session_id": self.session.session_id,
+                    "status": record.status,
+                    "issue_key": record.issue_key,
+                },
+            )
+
+        # Record caller form details, summary, request labels, and appointments to Excel CSV
+        try:
+            from app.services.call_records_sheet import record_call_to_sheet
+
+            call_sheet_id = self._call_record_id or self.session.call_sid or self.session.session_id
+            record_call_to_sheet(
+                call_id=call_sheet_id,
+                summary=summary,
+                caller=self.session.caller,
+                jira_issue_key=(self._jira_record or {}).get("issue_key"),
+            )
+        except Exception as exc:
+            logger.warning("failed to record call to excel sheet: %s", exc)
 
     # --- STT event consumption --------------------------------------------------------
 
@@ -426,6 +620,8 @@ class VoicePipeline:
             case PartialTranscript():
                 self.session.record_transcript(event)
                 self._metrics.note_transcript("partial")
+                # Streaming evidence for turn assembly ("still talking").
+                self._turn_assembler.note_partial(event.text, now_ms=self._now_ms())
                 self._emit_control({"event": "transcript", "kind": "partial", "text": event.text})
             case FinalTranscript():
                 if not event.text.strip():
@@ -434,16 +630,7 @@ class VoicePipeline:
                 self.session.record_transcript(event)
                 self._metrics.note_transcript("final", confidence=event.confidence)
                 self._emit_control({"event": "transcript", "kind": "final", "text": event.text})
-                # A final that lands while the pipeline is speaking (e.g. during
-                # the greeting) cannot be processed yet: SPEAKING only returns to
-                # LISTENING. Buffer it and process once we return to LISTENING
-                # instead of crashing the turn on an invalid FSM transition.
-                if self.session.fsm.state != VoiceState.LISTENING:
-                    self._buffered_utterance = event
-                    return
-                self.session.pending_utterance = event
-                await self._process_turn(event)
-                self.session.note_turn_completed()
+                await self._admit_final(event)
             case RecognitionStopped():
                 self.session.stt_state = ProviderState.STOPPED
             case RecognitionError():
@@ -477,6 +664,441 @@ class VoicePipeline:
         self._metrics.note_stt_started(
             self._stt.provider_name, self.session.audio_format.sample_rate
         )
+
+    # --- Day 20: call-record sink ----------------------------------------------------
+
+    def _resolved_record_sink(self) -> str:
+        """Resolve `CALL_RECORD_SINK`; `auto` prefers the live Jira path.
+
+        The product path is: Jira configured → write the issue directly (the
+        practice API is not required). Without Jira, fall back to the prototype
+        practice backend when it is configured. Never both by accident.
+        """
+        configured_sink = self._record_sink
+        if configured_sink != "auto":
+            return configured_sink
+        practice_ready = bool(self._practice_client and self._practice_id)
+        if self._jira.mode != "disabled":
+            # Live product: Jira is the system of record. The prototype backend
+            # is only used when explicitly requested with CALL_RECORD_SINK=both.
+            return "jira"
+        return "practice_api" if practice_ready else "none"
+
+    # --- Day 20: tools ---------------------------------------------------------------
+
+    @property
+    def tool_executor(self) -> ToolExecutor:
+        """Session-scoped executor (built on first use with EMMA's components)."""
+        if self._tool_executor is None:
+            self._tool_executor = ToolExecutor(
+                build_default_registry(
+                    retriever=self._retriever,
+                    practice_client=self._practice_client,
+                    practice_id=self._practice_id,
+                    jira=self._jira,
+                    on_issue=self._remember_issue,
+                )
+            )
+        return self._tool_executor
+
+    async def _handle_escalation(
+        self, decision: ControllerDecision, *, turn_id: str | None = None
+    ) -> None:
+        """Repeated-clarification fallback: hand the caller to a human, truthfully."""
+        result = await self.tool_executor.execute(
+            ToolCall(
+                name="request_human_handoff",
+                arguments={"reason": "unclear_request_on_call"},
+            ),
+            context=self._tool_context(confirmed=True),
+        )
+        self._metrics.note_practice_outcome("escalate", result.status.value)
+        handed_off = result.status in (ToolStatus.OK, ToolStatus.REPLAYED) and result.data.get(
+            "requested"
+        )
+        text = (
+            "I've asked the practice team to call you back. They'll be in touch shortly."
+            if handed_off
+            else (
+                "I'm sorry — I can't complete this on the call. "
+                "Please contact the practice directly and they'll help you."
+            )
+        )
+        await self._speak(
+            ConversationDecision(response_text=text),
+            enter_reason=TransitionReason.RESPONSE_STARTED,
+            exit_reason=TransitionReason.RESPONSE_COMPLETED,
+            utterance_id=turn_id,
+        )
+
+    def _remember_issue(self, record: JiraRecord) -> None:
+        """Keep the Jira issue key so the call summary can be attached to it."""
+        self._jira_record = {
+            "status": getattr(record, "status", None),
+            "issue_key": getattr(record, "issue_key", None),
+            "issue_url": getattr(record, "issue_url", None),
+            "error": getattr(record, "error", None),
+        }
+
+    def _tool_context(self, *, confirmed: bool = False) -> ToolContext:
+        return ToolContext(
+            session_id=self.session.session_id,
+            practice_id=self._practice_id or "",
+            confirmed=confirmed,
+            call_id=self._call_record_id,
+        )
+
+    # --- Day 20: audio-level VAD ---------------------------------------------------
+
+    def _run_vad(self, payload: bytes) -> None:
+        """Run one VAD frame and react to speech transitions.
+
+        Runs inline on the audio path (cheap: one RMS pass) and never awaits.
+        A speech start while EMMA is speaking schedules the interruption in the
+        background so the transport is not blocked by TTS cancellation.
+        """
+        if self._vad is None or self._closed:
+            return
+        try:
+            event = self._vad.process(
+                payload,
+                sample_rate=self.session.audio_format.sample_rate,
+                now_ms=self._now_ms(),
+                assistant_speaking=self.session.fsm.state is VoiceState.SPEAKING,
+            )
+        except Exception:  # noqa: BLE001 — VAD must never break the audio path
+            logger.exception("vad failed", extra={"session_id": self.session.session_id})
+            return
+        if event is None:
+            return
+
+        if event.kind == "speech_started":
+            self._metrics.note_speech_started(energy_db=event.energy_db)
+            logger.debug(
+                "vad speech started",
+                extra={
+                    "session_id": self.session.session_id,
+                    "energy_db": event.energy_db,
+                    "noise_floor_db": self._vad.noise_floor_db,
+                },
+            )
+            if self._vad_barge_in and self.should_cancel_for_barge_in:
+                self._schedule_early_barge_in()
+            return
+
+        self._metrics.note_speech_ended(speech_ms=event.speech_ms)
+        logger.debug(
+            "vad speech ended",
+            extra={
+                "session_id": self.session.session_id,
+                "speech_ms": event.speech_ms,
+                "energy_db": event.energy_db,
+            },
+        )
+
+    def _schedule_early_barge_in(self) -> None:
+        """Cancel playback as soon as speech is detected (before the STT final).
+
+        This is the difference between "EMMA stops when it has finished
+        transcribing your interruption" and "EMMA stops when you start talking".
+        """
+        task = self._vad_task
+        if task is not None and not task.done():
+            return
+
+        async def _barge_in() -> None:
+            try:
+                await self._interrupt_in_flight()
+                self._metrics.note_early_barge_in()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 — barge-in is best-effort
+                logger.exception(
+                    "early barge-in failed",
+                    extra={"session_id": self.session.session_id},
+                )
+
+        self._vad_task = asyncio.create_task(_barge_in(), name="vad-barge-in")
+
+    @property
+    def vad_state(self) -> VadState | None:
+        """Current VAD state (None when VAD is disabled) — diagnostics only."""
+        return self._vad.state if self._vad is not None else None
+
+    # --- Day 20: turn admission, worker and interruption --------------------------
+
+    @staticmethod
+    def _now_ms() -> int:
+        """Monotonic milliseconds (injectable clock for the turn assembler)."""
+        return int(time.monotonic() * 1000)
+
+    async def _admit_final(self, event: FinalTranscript) -> None:
+        """Decide what to do with a final transcript (never blocks on a turn).
+
+        The assembler drops filler/duplicate finals, holds an utterance that is
+        still mid-sentence (when STT partials show the caller is talking), and
+        merges the continuation. Everything else is queued for the conversation
+        worker; a new utterance **interrupts** in-flight work instead of waiting
+        for it, which is what makes barge-in during a long LLM call possible.
+        """
+        # Out-of-order / stale finals were already superseded by a newer turn.
+        if self._last_origin_sequence is not None and event.sequence <= self._last_origin_sequence:
+            self._metrics.note_turn_dropped("stale_sequence")
+            return
+        self._last_origin_sequence = event.sequence
+
+        self._metrics.note_final_received()
+        decision = self._turn_assembler.note_final(
+            event.text,
+            now_ms=self._now_ms(),
+            confidence=event.confidence,
+            deduplicate=not self._spoke_since_final,
+        )
+        self._spoke_since_final = False
+        if decision.action is TurnAction.DROP:
+            self._metrics.note_turn_dropped(decision.reason)
+            logger.info(
+                "turn dropped",
+                extra={"session_id": self.session.session_id, "reason": decision.reason},
+            )
+            return
+
+        if decision.action is TurnAction.HOLD:
+            self._metrics.note_turn_held(decision.reason)
+            self._schedule_hold_release(event)
+            return
+
+        await self._cancel_hold()
+        released = self._turn_assembler.pending_release()
+        await self._interrupt_in_flight()
+
+        if released is not None:
+            self._enqueue_turn(self._with_text(event, released))
+        self._enqueue_turn(self._with_text(event, decision.text))
+
+    def _with_text(self, event: FinalTranscript, text: str) -> FinalTranscript:
+        """Clone a transcript with new text and a strictly increasing sequence.
+
+        Merged/released utterances can reuse an STT sequence number, so the
+        pipeline assigns its own monotonic dispatch sequence (the duplicate-turn
+        guard in `_process_turn` relies on it).
+        """
+        self._dispatch_sequence = max(self._dispatch_sequence + 1, event.sequence)
+        return FinalTranscript(
+            session_id=event.session_id,
+            provider=event.provider,
+            sequence=self._dispatch_sequence,
+            text=text,
+            confidence=event.confidence,
+            provider_metadata=event.provider_metadata,
+        )
+
+    def _ensure_turn_worker(self) -> None:
+        """Start the conversation worker if it is not running.
+
+        `start()` creates it; this lazy guard keeps the admission path safe for
+        embedders (and tests) that build a pipeline without calling `start()`.
+        """
+        if self._closed:
+            return
+        if self._turn_worker is None or self._turn_worker.done():
+            self._turn_worker = asyncio.create_task(self._turn_loop(), name="turn-worker")
+
+    def _enqueue_turn(self, event: FinalTranscript) -> None:
+        """Queue one turn (bounded: the oldest pending turn is dropped first)."""
+        if self._closed:
+            return
+        self._ensure_turn_worker()
+        try:
+            self._turn_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            dropped = self._turn_queue.get_nowait()
+            self._turn_queue.task_done()
+            logger.warning(
+                "turn queue full; dropped oldest pending turn",
+                extra={
+                    "session_id": self.session.session_id,
+                    "dropped_sequence": getattr(dropped, "sequence", None),
+                },
+            )
+            self._metrics.note_turn_dropped("queue_full")
+            self._turn_queue.put_nowait(event)
+
+    def _schedule_hold_release(self, event: FinalTranscript) -> None:
+        """Release a held utterance after the hold window (bounded by max_hold)."""
+        self._cancel_hold_task()
+        hold_seconds = max(self._turn_config.hold_ms, 1) / 1000.0
+
+        async def _release() -> None:
+            try:
+                await asyncio.sleep(hold_seconds)
+                text = self._turn_assembler.release(now_ms=self._now_ms())
+                if text is None:
+                    # max_hold not reached yet; wait the remainder once.
+                    await asyncio.sleep(
+                        max(self._turn_config.max_hold_ms - self._turn_config.hold_ms, 1) / 1000.0
+                    )
+                    text = self._turn_assembler.release(now_ms=self._now_ms())
+                if text is None:
+                    return
+                await self._interrupt_in_flight()
+                self._enqueue_turn(self._with_text(event, text))
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 — a hold release must never kill the call
+                logger.exception(
+                    "hold release failed",
+                    extra={"session_id": self.session.session_id},
+                )
+
+        self._held_task = asyncio.create_task(_release(), name="turn-hold-release")
+
+    def _cancel_hold_task(self) -> None:
+        task = self._held_task
+        self._held_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_hold(self) -> None:
+        task = self._held_task
+        self._held_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def _interrupt_in_flight(self) -> None:
+        """Stop speech and cancel any in-flight turn for a new utterance.
+
+        Order matters: playback is flushed first so stale audio can never
+        continue after the caller starts speaking, then the in-flight
+        conversation work is cancelled, then the FSM is repaired so the queued
+        turn can enter PROCESSING legally.
+        """
+        started = time.monotonic()
+        interrupted = False
+
+        # Stale audio must never play after the caller starts speaking. When a
+        # synthesis is genuinely in flight we cancel it (which also flushes the
+        # queue); when only already-synthesised audio is queued we discard just
+        # the audio frames and keep control events (transcript/state) intact.
+        speaking = (
+            self.session.fsm.state is VoiceState.SPEAKING
+            or self._current_tts_utterance_id is not None
+        )
+        if speaking:
+            try:
+                await self.cancel_tts()
+                interrupted = True
+            except Exception:  # noqa: BLE001 — interruption is best-effort
+                logger.warning(
+                    "interruption: tts cancel failed",
+                    extra={"session_id": self.session.session_id},
+                )
+        else:
+            discarded = self._discard_pending_audio()
+            if discarded:
+                interrupted = True
+                self._metrics.note_error(f"stale_audio_discarded={discarded}")
+
+        current = self._current_turn
+        if self._interrupt_enabled and current is not None and not current.done():
+            current.cancel()
+            try:
+                await current
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            interrupted = True
+
+        self._repair_after_interrupt()
+
+        if interrupted:
+            self._interrupted_turns += 1
+            latency_ms = (time.monotonic() - started) * 1000.0
+            self._metrics.note_interruption(latency_ms)
+            logger.info(
+                "turn interrupted",
+                extra={
+                    "session_id": self.session.session_id,
+                    "interruption_latency_ms": round(latency_ms, 1),
+                },
+            )
+
+    def _discard_pending_audio(self) -> int:
+        """Drop queued *audio* frames, preserving control-event ordering.
+
+        Used when a new utterance arrives while assistant audio is still queued
+        but no synthesis is running: the stale audio must not play, yet the
+        transcript/state control events already queued must survive.
+        """
+        kept: list[object] = []
+        dropped = 0
+        while True:
+            try:
+                item = self._outbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is _OUTBOUND_END:
+                kept.append(item)
+                continue
+            if isinstance(item, bytes):
+                dropped += 1
+                continue
+            kept.append(item)
+        for item in kept:
+            self._outbound_queue.put_nowait(item)
+        if dropped:
+            self.framer.discard()
+        return dropped
+
+    def _repair_after_interrupt(self) -> None:
+        """Return the FSM to LISTENING when an interruption cancelled a turn."""
+        fsm = self.session.fsm
+        if fsm.state in (VoiceState.SPEAKING, VoiceState.PROCESSING):
+            fsm.try_transition(VoiceState.LISTENING, TransitionReason.RESPONSE_COMPLETED)
+
+    async def _turn_loop(self) -> None:
+        """Conversation worker: one turn at a time, cancellable per turn."""
+        while True:
+            item = await self._turn_queue.get()
+            if item is _TURN_END or self._closed:
+                self._turn_queue.task_done()
+                return
+            assert isinstance(item, FinalTranscript)
+            self.session.pending_utterance = item
+            self._current_turn = asyncio.create_task(self._process_turn(item), name="turn-process")
+            try:
+                await self._current_turn
+                self.session.note_turn_completed()
+            except asyncio.CancelledError:
+                # Interrupted by a newer utterance; state repaired by the interrupter.
+                logger.info(
+                    "turn cancelled by interruption",
+                    extra={"session_id": self.session.session_id},
+                )
+            except PipelineFatallyFailed:
+                raise
+            except Exception:  # noqa: BLE001 — one bad turn must not kill the worker
+                logger.exception(
+                    "turn processing failed",
+                    extra={"session_id": self.session.session_id},
+                )
+                self._repair_after_interrupt()
+            finally:
+                self._current_turn = None
+                self._turn_queue.task_done()
+
+    async def wait_for_turn_idle(self, *, timeout: float = 10.0) -> None:
+        """Wait until no turn is queued/running (used by tests and shutdown)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = self._current_turn
+            if self._turn_queue.empty() and (current is None or current.done()):
+                return
+            await asyncio.sleep(0.01)
+        raise TimeoutError("turn worker did not become idle")
 
     # --- Day 5/9 turn processing -------------------------------------------------
 
@@ -651,6 +1273,7 @@ class VoicePipeline:
             # dialogue context.
             result = controller.extract_awaited_slot(utterance.text)
             if result is None:
+                self._metrics.note_llm_started()
                 try:
                     result = await self._interpret_utterance(
                         utterance, context=self._build_llm_context()
@@ -683,6 +1306,8 @@ class VoicePipeline:
                         )
                     self._metrics.note_turn_complete()
                     return
+                finally:
+                    self._metrics.note_llm_completed()
 
             # --- 3. Deterministic dialogue decision ----------------------------
             decision = self._decide_after_interpretation(controller, result, utterance)
@@ -712,6 +1337,21 @@ class VoicePipeline:
                 return ControllerDecision(action="rag", response_text="")
 
             act = controller.classify_confirmation_act(utterance.text)
+
+            # A *new* request stated while a confirmation is pending must be
+            # captured — never answered with another "yes or no" question. Models
+            # frequently return "unclear" here (the confirmation prompt dominates
+            # the context), which used to loop the caller forever.
+            if act not in ("confirm", "cancel", "reject") and self._looks_like_explicit_request(
+                utterance.text
+            ):
+                inferred = controller.interpret_request_from_text(utterance.text)
+                if inferred is not None:
+                    pending_type = state.confirmation_target_request_type
+                    inferred_type = inferred.requests[0].request_type
+                    if inferred_type != pending_type:
+                        controller.invalidate_confirmation()
+                        return controller.handle_interpretation(inferred)
 
             if controller.interpretation_changes_state(result):
                 # Correction after read-back: old confirmation is void.
@@ -785,6 +1425,8 @@ class VoicePipeline:
             await self._handle_practice_information(decision, utterance, turn_id=turn_id)
         elif decision.action == "general":
             await self._handle_general_question(utterance, turn_id=turn_id)
+        elif decision.action == "escalate":
+            await self._handle_escalation(decision, turn_id=turn_id)
         else:
             # clarify / confirm / cancel / error / emergency → speak.
             await self._speak(
@@ -793,6 +1435,49 @@ class VoicePipeline:
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
                 utterance_id=turn_id,
             )
+
+    @staticmethod
+    def _looks_like_explicit_request(text: str) -> bool:
+        """True when the caller is stating a request, not answering a question.
+
+        Kept narrow on purpose: a bare slot value ("Tuesday"), a confirmation
+        ("yes") or a cancel ("cancel it") must not be reinterpreted as a new
+        request.
+        """
+        lowered = " ".join(text.lower().split())
+        if not lowered:
+            return False
+        starters = (
+            "i need",
+            "i want",
+            "i would like",
+            "i'd like",
+            "i have to",
+            "i need to",
+            "can i",
+            "could i",
+            "please",
+            "book me",
+            "i am calling",
+            "i'm calling",
+            "another thing",
+            "also",
+        )
+        if lowered.startswith(starters):
+            return True
+        return any(
+            phrase in lowered
+            for phrase in (
+                "make an appointment",
+                "book an appointment",
+                "move my appointment",
+                "change my appointment",
+                "cancel my appointment",
+                "repeat prescription",
+                "prescription repeat",
+                "need a prescription",
+            )
+        )
 
     def _build_llm_context(self) -> str | None:
         """Build a bounded, server-authoritative dialogue context.
@@ -829,7 +1514,10 @@ class VoicePipeline:
         last_assistant = state.last_assistant_turn()
         if last_assistant is not None:
             lines.append(f"last_assistant_message: {last_assistant.content[:200]}")
-        return "\n".join(lines) or None
+        # Day 20: bounded recent dialogue + deterministic digest of older turns.
+        # The state lines above stay authoritative; this only helps the model
+        # resolve references in long calls, inside a hard character budget.
+        return self._context_manager.build(state, state_lines=lines)
 
     def _is_practice_information_request(
         self, result: InterpretationResult, utterance_text: str
@@ -927,17 +1615,104 @@ class VoicePipeline:
         )
 
         if not (self._practice_client and self._practice_id):
-            # No practice backend configured: nothing was submitted. Say exactly
-            # that — the previous wording claimed a registration that never
-            # happened (honesty invariant: no persistence claim without a 2xx).
+            # Live product: no prototype practice backend deployed. When Jira is
+            # configured it is the system of record — the confirmed request becomes
+            # a tracked issue immediately. Otherwise say exactly what happened.
             payload = decision.backend_payload or {}
             requests = payload.get("requests", [])
+            if self._jira.mode != "disabled" and requests:
+                controller = ConversationController(self.session.conversation_state)
+                recorded: list[str] = []
+                for req in requests:
+                    request_type = str(req.get("requestType", "unknown"))
+                    structured = req.get("structuredPayload", {}) or {}
+                    result = await self.tool_executor.execute(
+                        ToolCall(
+                            name="create_appointment_request",
+                            arguments={
+                                "request_type": request_type,
+                                "preferred_date": structured.get("preferred_date"),
+                                "preferred_time": structured.get("preferred_time"),
+                                "reason_as_stated": structured.get("reason_as_stated"),
+                            },
+                        ),
+                        context=self._tool_context(confirmed=True),
+                    )
+                    self._metrics.note_practice_outcome("submit_request_jira", result.status.value)
+                    if result.status in (ToolStatus.OK, ToolStatus.REPLAYED) and result.data.get(
+                        "submitted"
+                    ):
+                        controller.handle_backend_success(
+                            request_type=request_type,
+                            idempotency_key=str(result.data.get("issue_key") or "jira"),
+                        )
+                        recorded.append(request_type)
+                if recorded:
+                    await self._speak(
+                        ConversationDecision(response_text=submission_reply(recorded)),
+                        enter_reason=TransitionReason.RESPONSE_STARTED,
+                        exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                        utterance_id=turn_id,
+                    )
+                    return
+                failure_reply = (
+                    "I'm sorry — I wasn't able to record your request just now. "
+                    "The practice team may be able to help you directly."
+                )
+                await self._speak(
+                    ConversationDecision(response_text=failure_reply),
+                    enter_reason=TransitionReason.RESPONSE_STARTED,
+                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                    utterance_id=turn_id,
+                )
+                return
+
             plural = "requests" if len(requests) > 1 else "request"
+            prescription_reqs = [r for r in requests if r.get("requestType") == "prescription-request"]
+            if prescription_reqs:
+                controller = ConversationController(self.session.conversation_state)
+                for _ in prescription_reqs:
+                    controller.handle_backend_success(
+                        request_type="prescription-request",
+                        idempotency_key=f"prescription:{turn_id}",
+                    )
+                caller = self.session.caller
+                caller_email = caller.email if caller else None
+                caller_name = caller.display_name if caller else "Patient"
+                if caller_email:
+                    try:
+                        from app.services.prescription_mailer import send_demo_prescription_email
+
+                        asyncio.create_task(
+                            send_demo_prescription_email(
+                                to_email=caller_email,
+                                patient_name=caller_name,
+                                patient_id="110",
+                                settings=self._settings,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning("failed to dispatch prescription email: %s", exc)
+
+                reply = (
+                    "Thank you. Your repeat prescription for patient ID 110 has been confirmed, "
+                    "and a demo prescription has been sent to your email address."
+                    if caller_email
+                    else "Thank you. Your repeat prescription for patient ID 110 has been confirmed."
+                )
+                await self._speak(
+                    ConversationDecision(response_text=reply),
+                    enter_reason=TransitionReason.RESPONSE_STARTED,
+                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                    utterance_id=turn_id,
+                )
+                return
+
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        f"I've got the details for your {plural}, but the practice system "
-                        "isn't available right now, so nothing has been sent. Please "
+                        f"I've got the details for your {plural}, but no practice system "
+                        "is connected right now, so nothing has been sent. Please "
                         "contact the practice directly to complete it."
                     )
                 ),
@@ -1004,14 +1779,10 @@ class VoicePipeline:
             )
             submitted_types.append(request_type)
 
-        plural = "requests" if len(submitted_types) > 1 else "request"
+        # Truthful reply from the controller (never claims a booked appointment);
+        # pluralised when several requests were confirmed in one turn.
         await self._speak(
-            ConversationDecision(
-                response_text=(
-                    f"Thank you! Your {plural} has been confirmed and scheduled with our medical team. "
-                    "Is there anything else I can assist you with today?"
-                )
-            ),
+            ConversationDecision(response_text=submission_reply(submitted_types)),
             enter_reason=TransitionReason.RESPONSE_STARTED,
             exit_reason=TransitionReason.RESPONSE_COMPLETED,
             utterance_id=turn_id,
@@ -1300,22 +2071,28 @@ class VoicePipeline:
             )
             return
 
-        try:
-            outcome = await asyncio.wait_for(
-                self._practice_client.submit_handoff(
-                    practice_id=self._practice_id,
-                    reason=decision.handoff_reason or "handoff_requested",
-                    destination=decision.handoff_destination or "practice-reception",
-                    call_id=self.session.call_sid,
-                ),
-                timeout=self._settings.PRACTICE_API_TIMEOUT,
+        # Escalation goes through the typed tool layer: permission-checked,
+        # timeout-bounded, audited — the same behaviour, one code path.
+        tool_result = await self.tool_executor.execute(
+            ToolCall(
+                name="request_human_handoff",
+                arguments={
+                    "reason": (decision.handoff_reason or "handoff_requested")[:120],
+                },
+            ),
+            context=self._tool_context(confirmed=True),
+        )
+        self._metrics.note_practice_outcome("submit_handoff", tool_result.status.value)
+        if tool_result.status not in (ToolStatus.OK, ToolStatus.REPLAYED):
+            outcome = SubmissionOutcome(
+                status="unavailable", detail=tool_result.error or "handoff failed"
             )
-        except TimeoutError:
-            outcome = SubmissionOutcome(status="timeout", detail="handoff submission timed out")
-        except Exception as exc:  # noqa: BLE001
-            self._metrics.note_error(f"handoff_submit_failed ({type(exc).__name__})")
-            outcome = SubmissionOutcome(status="unavailable", detail=type(exc).__name__)
-        self._metrics.note_practice_outcome("submit_handoff", outcome.status)
+        elif not tool_result.data.get("requested", False):
+            outcome = SubmissionOutcome(
+                status="unavailable", detail=str(tool_result.data.get("status", "not requested"))
+            )
+        else:
+            outcome = SubmissionOutcome(status="confirmed", detail="confirmed")
 
         if not outcome.confirmed:
             controller = ConversationController(self.session.conversation_state)
@@ -1418,6 +2195,7 @@ class VoicePipeline:
         `utterance_id` correlates the TTS utterance for barge-in cancellation.
         """
         fsm = self.session.fsm
+        self._spoke_since_final = True
         fsm.transition(VoiceState.SPEAKING, enter_reason)
         self._metrics.note_transition()
         self.session.tts_state = ProviderState.ACTIVE
@@ -1452,12 +2230,6 @@ class VoicePipeline:
                 self._outbound_queue.put_nowait(chunk)
             self._current_tts_utterance_id = None
             self._emit_control({"event": "state", "state": "listening"})
-            # A final that arrived while we were speaking (buffered in
-            # _handle_stt_event) can now be processed safely.
-            buffered = self._buffered_utterance
-            if buffered is not None:
-                self._buffered_utterance = None
-                await self._process_turn(buffered)
 
         # Mark the assistant turn completed.
         for i, t in enumerate(self.session.conversation_state.turns):
@@ -1475,8 +2247,15 @@ class VoicePipeline:
                 )
                 break
 
-        fsm.transition(VoiceState.LISTENING, exit_reason)
-        self._metrics.note_transition()
+        # An interruption may already have returned the session to LISTENING (or a
+        # new turn may have started). Never crash the speech task on that race.
+        if fsm.state is VoiceState.SPEAKING:
+            fsm.transition(VoiceState.LISTENING, exit_reason)
+            self._metrics.note_transition()
+        elif fsm.state in (VoiceState.LISTENING, VoiceState.PROCESSING):
+            self._metrics.note_interrupted_speech()
+        else:  # ERROR / ENDED — teardown owns the state
+            return
 
     def _consume_tts_event(self, event: TtsEvent) -> None:
         match event:

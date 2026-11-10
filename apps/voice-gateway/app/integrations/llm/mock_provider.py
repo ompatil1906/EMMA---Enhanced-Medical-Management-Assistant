@@ -220,7 +220,13 @@ class MockLLMProvider:
         # Confirmation words are deliberately left to the deterministic
         # controller. The model may still extract a correction ("yes, make it
         # Thursday") because that contains a new slot value.
-        if pending_confirmation and not self._contains_slot_value(text):
+        if (
+            pending_confirmation
+            and not self._contains_slot_value(text)
+            and not self._has_admin_keyword(text)
+        ):
+            # A bare non-answer ("maybe", "what about Saturday") stays a
+            # confirmation concern; a stated request must reach the controller.
             return self._clarification_interpretation("confirmation response")
 
         if isinstance(active_type, str) and self._looks_like_slot_value(

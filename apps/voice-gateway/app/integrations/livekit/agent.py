@@ -41,7 +41,11 @@ from app.core.config import Settings
 from app.domain.audio import AudioFormat
 from app.domain.events import AudioReceived
 from app.integrations.livekit import LiveKitAgent
-from app.services.caller_identity import CallerIdentity, first_name_from_participant
+from app.services.caller_identity import (
+    CallerIdentity,
+    caller_from_participant,
+    first_name_from_participant,
+)
 from app.services.voice_pipeline import VoicePipeline
 
 logger = logging.getLogger(__name__)
@@ -89,6 +93,8 @@ class EmmaAgentSession:
         self._session_id = ctx.job.id
         self._started = False
         self._stopped = False
+        self._teardown_requested = False
+        self._closed_event: asyncio.Event = asyncio.Event()
         self._input_tasks: set[asyncio.Task[None]] = set()
         self._play_task: asyncio.Task[None] | None = None
         self._agent = LiveKitAgent(
@@ -97,6 +103,9 @@ class EmmaAgentSession:
             room_name=self._room.name,
         )
         self._sequence = 0
+        self._attached_sids: set[Any] = set()
+        self._caller_frames = 0
+        self._audio_watchdog: asyncio.Task[None] | None = None
 
     @property
     def session_id(self) -> str:
@@ -122,21 +131,80 @@ class EmmaAgentSession:
 
         # Bridge: pipeline TTS output → room audio publication.
         self._play_task = asyncio.create_task(self._audio_output_loop())
+        self._audio_watchdog = asyncio.create_task(self._watch_for_caller_audio())
+
+    async def _watch_for_caller_audio(self, *, timeout: float = 12.0) -> None:
+        """Log loudly when no caller audio arrives (mic not published/denied)."""
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+        if self._stopped or self._caller_frames > 0:
+            return
+        logger.warning(
+            "no caller audio received: greeting only — check microphone permission, "
+            "track publication and subscription",
+            extra={"session_id": self._session_id},
+        )
 
     # --- room event bridging ----------------------------------------------------
 
     def _setup_room_handlers(self) -> None:
-        """Subscribe to caller audio, control messages, and room teardown."""
+        """Subscribe to caller audio, control messages, and room teardown.
+
+        Audio attachment is *reconciled from room state*, not only driven by the
+        `track_subscribed` event. When the caller publishes before the agent
+        joins (the normal browser flow), that event can fire during
+        `room.connect()` — i.e. before these handlers exist — and the track is
+        then never read: the greeting plays and the caller is never heard.
+        """
         self._room.on("track_subscribed")(self._on_track_subscribed)
+        # Late publications / late subscriptions must also be picked up.
+        for event_name in ("track_published", "participant_connected", "track_subscription_failed"):
+            try:
+                self._room.on(event_name)(self._on_room_changed)
+            except Exception:  # noqa: BLE001 — SDK event names vary by version
+                logger.debug("room event not available", extra={"event": event_name})
         self._room.on("data_received")(self._on_data_received)
         self._room.on("disconnected")(self._on_room_disconnected)
+        self._room.on("participant_disconnected")(self._on_participant_disconnected)
 
-        # A caller may already be publishing (late dispatch).
+        self._attach_existing_caller_audio()
+        # One delayed rescan covers the auto-subscribe window right after join.
+        self._input_tasks.add(asyncio.create_task(self._rescan_audio(delay=1.0)))
+
+    def _on_room_changed(self, *_: Any) -> None:
+        """Room membership/publication changed — reconcile caller audio again."""
+        if self._stopped:
+            return
+        self._attach_existing_caller_audio()
+
+    def _attach_existing_caller_audio(self) -> None:
+        """Start an input loop for every caller audio track we can see."""
+        attached = 0
         for participant in list(self._room.remote_participants.values()):
-            for publication in participant.track_publications.values():
+            if not self._is_caller(participant):
+                continue
+            for publication in list(getattr(participant, "track_publications", {}).values()):
                 track = getattr(publication, "track", None)
-                if track is not None and _is_audio_track(track):
-                    self._on_track_subscribed(track, publication, participant)
+                if track is None or not _is_audio_track(track):
+                    continue
+                self._start_input_loop(track, publication)
+                attached += 1
+        if attached:
+            logger.info(
+                "caller audio attached",
+                extra={"session_id": self._session_id, "tracks": attached},
+            )
+
+    async def _rescan_audio(self, *, delay: float) -> None:
+        """Re-reconcile once after join (auto-subscription may land late)."""
+        try:
+            await asyncio.sleep(delay)
+            if not self._stopped:
+                self._attach_existing_caller_audio()
+        except asyncio.CancelledError:
+            return
 
     def _is_caller(self, participant: Any) -> bool:
         identity = getattr(participant, "identity", None)
@@ -147,6 +215,14 @@ class EmmaAgentSession:
             return
         if not _is_audio_track(track) or not self._is_caller(participant):
             return
+        self._start_input_loop(track, publication)
+
+    def _start_input_loop(self, track: Any, publication: Any) -> None:
+        """Start (at most once per publication) the reader for one audio track."""
+        sid = getattr(publication, "sid", None) or getattr(track, "sid", None) or id(track)
+        if sid in self._attached_sids:
+            return
+        self._attached_sids.add(sid)
         task = asyncio.create_task(self._audio_input_loop(track))
         self._input_tasks.add(task)
         task.add_done_callback(self._input_tasks.discard)
@@ -175,10 +251,59 @@ class EmmaAgentSession:
             self._input_tasks.add(task)
             task.add_done_callback(self._input_tasks.discard)
 
+    def _on_participant_disconnected(self, participant: Any) -> None:
+        """End the session when the caller hangs up.
+
+        Without this the agent stayed in an empty room after the caller left;
+        the next browser tab would see the stale `agent-…` participant and show
+        "listening" while nobody was actually reading its audio.
+        """
+        if self._stopped:
+            return
+        if not self._is_caller(participant):
+            return
+        logger.info(
+            "caller left the room; stopping session",
+            extra={"session_id": self._session_id},
+        )
+        self._request_stop("caller_left")
+
+    def _request_stop(self, reason: str) -> None:
+        """Tear the session down from an SDK callback without blocking it.
+
+        Guarded by its own flag — setting `_stopped` here would make `stop()`
+        return immediately and leave the pipeline (and the room participant)
+        alive, which is exactly the zombie-agent failure this fixes.
+        """
+        if self._teardown_requested:
+            return
+        self._teardown_requested = True
+        task = asyncio.create_task(self._stop_async(reason))
+        self._input_tasks.add(task)
+        task.add_done_callback(self._input_tasks.discard)
+
+    async def _stop_async(self, reason: str) -> None:
+        try:
+            await self.stop(reason=reason)
+        except Exception:  # noqa: BLE001 — teardown is best-effort
+            logger.exception(
+                "session stop failed",
+                extra={"session_id": self._session_id, "reason": reason},
+            )
+        # Leave the room so the `agent-<job>` participant disappears immediately
+        # instead of lingering after the caller hung up.
+        try:
+            await self._room.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.debug(
+                "room disconnect after stop failed",
+                extra={"session_id": self._session_id},
+            )
+
     def _on_room_disconnected(self, *_: Any) -> None:
-        # The pipeline is torn down by `stop()`; mark stopped so input loops
-        # terminate promptly when the room ends itself.
-        self._stopped = True
+        # Ask `stop()` to run (it owns pipeline teardown); do not pre-set
+        # `_stopped` or the teardown would be skipped.
+        self._request_stop("room_disconnect")
 
     async def _cancel_for_barge_in(self) -> None:
         try:
@@ -216,6 +341,7 @@ class EmmaAgentSession:
                 if not audio:
                     continue
                 self._sequence += 1
+                self._caller_frames += 1
                 await self._pipeline.submit_audio(
                     AudioReceived(
                         session_id=self._session_id,
@@ -269,6 +395,10 @@ class EmmaAgentSession:
                 extra={"session_id": self._session_id, "detail": type(exc).__name__},
             )
 
+    async def wait_closed(self) -> None:
+        """Block until this session's teardown has finished."""
+        await self._closed_event.wait()
+
     async def stop(self, *, reason: str = "session_stop") -> None:
         """Stop the agent session and release resources."""
         if self._stopped:
@@ -284,6 +414,14 @@ class EmmaAgentSession:
             except Exception:  # noqa: BLE001 — teardown must not raise
                 pass
         self._input_tasks.clear()
+
+        if self._audio_watchdog is not None:
+            self._audio_watchdog.cancel()
+            try:
+                await self._audio_watchdog
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._audio_watchdog = None
 
         if self._play_task is not None:
             self._play_task.cancel()
@@ -303,6 +441,7 @@ class EmmaAgentSession:
                 )
 
         await self._pipeline.aclose(reason=reason)
+        self._closed_event.set()
         logger.info(
             "emma agent session stopped",
             extra={"session_id": self._session_id, "reason": reason},
@@ -373,11 +512,10 @@ def _first_caller_identity(room: Any) -> str | None:
 
 
 def _caller_identity(room: Any, identity: str | None) -> CallerIdentity | None:
-    """Build the sanitisd intake identity for the first caller in the room.
+    """Build the sanitised intake identity for the first caller in the room.
 
-    The browser form's first name arrives on the participant name/metadata (set
-    server-side by the token endpoint). Absent or unusable → None, and the
-    greeting falls back to the generic wording.
+    The browser form's full caller data arrives on the participant metadata
+    (set server-side by the token endpoint). Absent or unusable -> None.
     """
     target = identity or _first_caller_identity(room)
     if target is None:
@@ -385,8 +523,7 @@ def _caller_identity(room: Any, identity: str | None) -> CallerIdentity | None:
     for participant in list(getattr(room, "remote_participants", {}).values()):
         if getattr(participant, "identity", None) != target:
             continue
-        first_name = first_name_from_participant(participant)
-        return CallerIdentity(first_name=first_name) if first_name else None
+        return caller_from_participant(participant)
     return None
 
 
@@ -527,12 +664,21 @@ async def entrypoint(ctx: Any) -> None:
         caller_identity = first
         await _launch_session()
 
-    # Keep the session alive until the room disconnects.
+    # Keep the job alive until the session ends (caller left, error, or room
+    # gone) — waiting on the room alone kept the job process busy after the
+    # caller hung up, so the next call had no free worker slot.
     try:
-        await room_disconnected.wait()
+        if session is not None:
+            await session.wait_closed()
+        else:  # pragma: no cover - defensive: no session was ever created
+            await room_disconnected.wait()
     finally:
         if session is not None:
-            await session.stop(reason="room_disconnect")
+            await session.stop(reason="session_closed")
+        try:
+            await room.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.debug("job room disconnect failed")
 
 
 def build_speech_factory(settings: Settings) -> Any:
@@ -573,9 +719,12 @@ def create_worker_options() -> Any:
     from app.integrations.livekit import _import_livekit_agents
 
     agents = _import_livekit_agents()
-    return agents.WorkerOptions(
-        entrypoint_fnc=entrypoint,
-    )
+    try:
+        # Two idle processes: a new call is served immediately while the previous
+        # one is still tearing down (one job per process otherwise serialises).
+        return agents.WorkerOptions(entrypoint_fnc=entrypoint, num_idle_processes=2)
+    except TypeError:  # older SDK without the option
+        return agents.WorkerOptions(entrypoint_fnc=entrypoint)
 
 
 def seed_livekit_env(settings: Settings) -> None:

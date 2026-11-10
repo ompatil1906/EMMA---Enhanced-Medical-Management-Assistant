@@ -106,6 +106,8 @@ def _caller_payload(caller: CallerIdentity | None) -> dict[str, Any]:
         payload["firstName"] = caller.first_name
     if caller.last_name:
         payload["lastName"] = caller.last_name
+    if caller.email:
+        payload["email"] = caller.email
     if caller.mobile:
         payload["mobile"] = caller.mobile
     if caller.reason:

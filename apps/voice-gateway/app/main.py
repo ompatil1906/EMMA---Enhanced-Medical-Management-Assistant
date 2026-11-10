@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.routes.diagnostics import router as diagnostics_router
 from app.api.routes.health import router as health_router
 from app.api.routes.livekit_token import router as livekit_token_router
 from app.api.routes.websocket import router as websocket_router
@@ -111,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(websocket_router)
     app.include_router(livekit_token_router)
+    app.include_router(diagnostics_router)
     return app
 
 

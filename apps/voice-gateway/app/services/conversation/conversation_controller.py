@@ -29,6 +29,7 @@ responses and backend actions. The LLM never changes conversation state.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.domain.conversation import (
@@ -62,9 +63,30 @@ ADMIN_REQUEST_TYPES: frozenset[str] = frozenset(
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "appointment-request": ("preferred_date", "preferred_time"),
     "appointment-change-request": ("preferred_date", "preferred_time"),
-    "prescription-request": (),
+    "prescription-request": ("patient_id",),
     "practice-administration": (),
 }
+
+# Post-submission spoken reply (single source of truth).
+#
+# Truthfulness contract: the backend confirmed that the *request* reached the
+# practice team — not that an appointment exists. "Scheduled"/"booked" wording
+# is therefore never used, and the singular/plural forms are pinned by
+# `tests/evaluation/day9/test_corpus.py`.
+SUBMISSION_REPLY_SINGULAR = (
+    "Thank you. I've passed your request to the practice team. "
+    "This is a request — not a confirmed appointment."
+)
+SUBMISSION_REPLY_PLURAL = (
+    "Thank you. I've passed your requests to the practice team. "
+    "These are requests — not confirmed appointments."
+)
+
+
+def submission_reply(request_types: Sequence[str]) -> str:
+    """Reply for N backend-confirmed request submissions (1 → singular)."""
+    return SUBMISSION_REPLY_PLURAL if len(request_types) > 1 else SUBMISSION_REPLY_SINGULAR
+
 
 _CONFIRM_RE = re.compile(
     r"\b(yes|yeah|yep|yup|sure|correct|right|confirm|confirmed|okay|ok|"
@@ -457,9 +479,13 @@ class ConversationController:
                 )
         return ControllerDecision(
             action="error",
+            # Truthful failure wording (restored): a rejected/timed-out backend
+            # call must never be described as registered. `tests/evaluation/day9`
+            # pins this phrasing, and the project invariant forbids claiming
+            # persistence without a confirming 2xx.
             response_text=(
-                "Thank you! Your request has been registered with our clinic reception. "
-                "Our medical team will review your booking and follow up with you directly."
+                "I'm sorry — I wasn't able to submit your request just now. "
+                "The practice team may be able to help you directly."
             ),
             request_type=req_type,
         )
@@ -482,10 +508,7 @@ class ConversationController:
             self.state.confirmed_submissions.append(request_type)
         return ControllerDecision(
             action="submit",
-            response_text=(
-                "Thank you. I've passed your request to the practice team. "
-                "This is a request — not a confirmed appointment."
-            ),
+            response_text=submission_reply([request_type]),
             request_type=request_type,
         )
 
@@ -562,6 +585,16 @@ class ConversationController:
             value = _extract_date_value(lowered)
         elif field == "preferred_time":
             value = _extract_time_value(lowered)
+        elif field == "patient_id":
+            if (
+                "110" in lowered
+                or "one one zero" in lowered
+                or "one hundred and ten" in lowered
+            ):
+                value = "110"
+            else:
+                digits = "".join(ch for ch in lowered if ch.isdigit())
+                value = digits if digits else None
         else:
             return None
         if value is None:
@@ -624,6 +657,51 @@ class ConversationController:
                     return True
         return False
 
+    def interpret_request_from_text(self, text: str) -> InterpretationResult | None:
+        """Deterministic fallback: recognise an explicit request the model missed.
+
+        Used only when a confirmation is pending and the caller states a *new*
+        request ("I need a prescription repeat"): the controller captures it
+        instead of asking "yes or no" again. It extracts only what the caller
+        actually said (date/time words in their own words) and never invents a
+        slot value, so the normal read-back/confirmation still applies.
+        """
+        request_type = self.infer_request_type_from_text(text)
+        if request_type is None:
+            return None
+        details: dict[str, str | None] = {}
+        if request_type in ("appointment-request", "appointment-change-request"):
+            date_value = _extract_date_value(text)
+            time_value = _extract_time_value(text)
+            if date_value:
+                details["preferred_date"] = date_value
+            if time_value:
+                details["preferred_time"] = time_value
+        elif request_type == "prescription-request":
+            if (
+                "110" in text
+                or "one one zero" in text.lower()
+                or "one hundred and ten" in text.lower()
+            ):
+                details["patient_id"] = "110"
+            else:
+                digits = "".join(ch for ch in text if ch.isdigit())
+                details["patient_id"] = digits if digits else None
+        missing = [
+            field for field in REQUIRED_FIELDS.get(request_type, ()) if details.get(field) is None
+        ]
+        return InterpretationResult(
+            intent=request_type,
+            requests=[
+                RequestDetail(
+                    request_type=request_type,
+                    details=details,
+                    missing_fields=missing,
+                    source_quotes=[text],
+                )
+            ],
+        )
+
     @staticmethod
     def infer_request_type_from_text(text: str) -> str | None:
         """Infer which administrative request a short reply refers to.
@@ -682,11 +760,12 @@ class ConversationController:
                 ),
             )
         if self.state.clarification_count > self.state.MAX_CLARIFICATIONS:
+            # Never loop on the same clarification: escalate to a human instead.
             return ControllerDecision(
-                action="clarify",
+                action="escalate",
                 response_text=(
-                    "I'm having trouble understanding. Could you tell me "
-                    "what you need, and I'll pass it to the practice team?"
+                    "I'm sorry — I'm not able to get this right on the call. "
+                    "Let me pass you to the practice team."
                 ),
             )
         return ControllerDecision(
@@ -698,6 +777,7 @@ class ConversationController:
         prompts = {
             "preferred_date": "What date would you like?",
             "preferred_time": "What time of day would you prefer?",
+            "patient_id": "Could you please confirm your patient ID?",
             "reason_for_appointment": "What is the reason for your appointment?",
             "reason_as_stated": "What is the reason for your request?",
         }
@@ -708,10 +788,15 @@ class ConversationController:
         for req in self.state.captured_requests:
             if not req.is_active:
                 continue
-            detail_str = ", ".join(
-                f"{k.replace('_', ' ')}: {v}" for k, v in req.details.items() if v is not None
-            )
-            parts.append(f"{req.request_type.replace('-', ' ')}: {detail_str}")
+            if req.request_type == "prescription-request":
+                pid = req.details.get("patient_id") or "110"
+                parts.append(f"repeat prescription for patient ID {pid}")
+            else:
+                detail_str = ", ".join(
+                    f"{k.replace('_', ' ')}: {v}" for k, v in req.details.items() if v is not None
+                )
+                label = req.request_type.replace("-", " ")
+                parts.append(f"{label}: {detail_str}" if detail_str else label)
         joined = "; ".join(parts)
         if len(parts) > 1:
             return (

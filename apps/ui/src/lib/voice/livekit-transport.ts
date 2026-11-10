@@ -110,6 +110,60 @@ export function createLiveKitTransport(
   let remoteAudioCtx: AudioContext | null = null;
   let remoteAudioEl: HTMLMediaElement | null = null;
   let agentPresent = false;
+  /* An agent participant alone is NOT proof the assistant is alive: a stale
+     job from a previous call can still be listed in the room. Readiness is
+     the agent's first audio track (the greeting). If none arrives, say so
+     instead of sitting on "Listening" with nobody listening. */
+  let readinessTimer: number | null = null;
+  const clearReadinessTimer = () => {
+    if (readinessTimer !== null) {
+      window.clearTimeout(readinessTimer);
+      readinessTimer = null;
+    }
+  };
+
+  const markAgentAudio = () => {
+    clearReadinessTimer();
+    if (agentPresent) return;
+    agentPresent = true;
+    setState("listening");
+    emit({
+      type: "notice",
+      line: {
+        id: randomId("notice"),
+        text: "Connected to EMMA voice agent",
+        sample: false,
+      },
+    });
+  };
+
+  const announceAgentReady = () => {
+    if (agentPresent) return;
+    setState("connecting");
+    emit({
+      type: "notice",
+      line: {
+        id: randomId("notice"),
+        text: "Connected to EMMA — waiting for the assistant to speak…",
+        sample: false,
+      },
+    });
+    if (readinessTimer !== null) return;
+    readinessTimer = window.setTimeout(() => {
+      readinessTimer = null;
+      if (!active || closing || agentPresent) return;
+      emit({
+        type: "error",
+        message:
+          "The voice assistant is not responding (no audio). End the call and start a new one.",
+      });
+      setState("error");
+      emit({ type: "ended", reason: "error" });
+      stop();
+    }, 8000);
+  };
+
+
   let speechTicks = 0;
   const remoteDiag: RemoteAudioDiagnostics = {
     attached: false,
@@ -155,6 +209,7 @@ export function createLiveKitTransport(
   };
 
   const cleanupAudio = () => {
+    clearReadinessTimer();
     stopMonitor();
     if (remoteAudioTimer !== null) {
       window.clearInterval(remoteAudioTimer);
@@ -263,20 +318,6 @@ export function createLiveKitTransport(
 
       const RoomCtor = clientMod!.Room ?? clientMod!.default?.Room;
       room = new RoomCtor();
-
-      const announceAgentReady = () => {
-        if (agentPresent) return;
-        agentPresent = true;
-        setState("listening");
-        emit({
-          type: "notice",
-          line: {
-            id: randomId("notice"),
-            text: "Connected to EMMA voice agent",
-            sample: false,
-          },
-        });
-      };
 
       // Room event handlers.
       room.on("connected", () => {
@@ -485,6 +526,7 @@ export function createLiveKitTransport(
       // Count for the end-of-call metrics event; emitting metrics here would
       // replace the "Connected to EMMA voice agent" notice.
       framesReceived[0] += 1;
+      markAgentAudio();
       remoteDiag.attached = true;
       publishDiagnostics(remoteDiag);
 

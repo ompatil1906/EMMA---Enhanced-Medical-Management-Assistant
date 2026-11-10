@@ -24,6 +24,17 @@ from app.services.response_handler import DeterministicResponseHandler
 from app.services.voice_pipeline import VoicePipeline
 
 
+async def _feed(pipeline, event):
+    """Feed one STT event and wait for the conversation worker to finish.
+
+    Day 20 decoupled STT consumption from turn processing so a new utterance can
+    interrupt an in-flight turn; tests therefore synchronise explicitly instead
+    of relying on `_handle_stt_event` returning after the turn.
+    """
+    await pipeline._handle_stt_event(event)
+    await pipeline.wait_for_turn_idle()
+
+
 def _make_settings(**overrides: Any) -> Settings:
     data = {
         "PRACTICE_ID": "demo-practice-001",
@@ -150,7 +161,7 @@ async def test_emergency_guard_runs_before_llm_and_backend() -> None:
     event = _final_transcript(
         pipeline, "I am having severe chest pain. I also want an appointment."
     )
-    await pipeline._handle_stt_event(event)
+    await _feed(pipeline, event)
 
     # Verify the emergency script was spoken (via _speak → TTS).
     # The pipeline's _speak method queues audio chunks to the outbound queue.
@@ -198,7 +209,7 @@ async def test_appointment_request_scenario() -> None:
     event1 = _final_transcript(
         pipeline, "I would like to request an appointment next Wednesday morning.", 1
     )
-    await pipeline._handle_stt_event(event1)
+    await _feed(pipeline, event1)
 
     # Verify a confirmation was requested (READY_FOR_CONFIRMATION state).
     controller = ConversationController(pipeline.session.conversation_state)
@@ -251,14 +262,14 @@ async def test_correction_invalidates_confirmation() -> None:
 
     # Turn 1: appointment request.
     event1 = _final_transcript(pipeline, "I want an appointment on Tuesday morning.", 1)
-    await pipeline._handle_stt_event(event1)
+    await _feed(pipeline, event1)
 
     controller = ConversationController(pipeline.session.conversation_state)
     assert controller.state.confirmation_pending is True
 
     # Turn 2: correction.
     event2 = _final_transcript(pipeline, "Actually, make that Wednesday afternoon.", 2)
-    await pipeline._handle_stt_event(event2)
+    await _feed(pipeline, event2)
 
     # Confirmation should be invalidated and a new one requested.
     assert controller.state.confirmation_pending is True
@@ -298,7 +309,7 @@ async def test_multiple_requests_independent() -> None:
     event = _final_transcript(
         pipeline, "I need a repeat prescription and I also want an appointment.", 1
     )
-    await pipeline._handle_stt_event(event)
+    await _feed(pipeline, event)
 
     controller = ConversationController(pipeline.session.conversation_state)
     reqs = controller.state.captured_requests
@@ -350,14 +361,14 @@ async def test_cancellation_before_submission() -> None:
     event1 = _final_transcript(
         pipeline, "I want to request an appointment next Wednesday morning.", 1
     )
-    await pipeline._handle_stt_event(event1)
+    await _feed(pipeline, event1)
 
     controller = ConversationController(pipeline.session.conversation_state)
     assert controller.state.confirmation_pending is True
 
     # Turn 2: cancel.
     event2 = _final_transcript(pipeline, "Cancel my appointment request.", 2)
-    await pipeline._handle_stt_event(event2)
+    await _feed(pipeline, event2)
 
     # The cancelled request should not be submittable.
     reqs = controller.state.captured_requests
@@ -406,13 +417,13 @@ async def test_rejection_no_submission() -> None:
     event1 = _final_transcript(
         pipeline, "I want to request an appointment next Wednesday morning.", 1
     )
-    await pipeline._handle_stt_event(event1)
+    await _feed(pipeline, event1)
 
     controller = ConversationController(pipeline.session.conversation_state)
     assert controller.state.confirmation_pending is True
 
     event2 = _final_transcript(pipeline, "No, don't submit.", 2)
-    await pipeline._handle_stt_event(event2)
+    await _feed(pipeline, event2)
 
     # No submission should have happened.
     reqs = controller.state.captured_requests
@@ -463,13 +474,13 @@ async def test_ambiguous_confirmation_no_submission() -> None:
     event1 = _final_transcript(
         pipeline, "I want to request an appointment next Wednesday morning.", 1
     )
-    await pipeline._handle_stt_event(event1)
+    await _feed(pipeline, event1)
 
     controller = ConversationController(pipeline.session.conversation_state)
     assert controller.state.confirmation_pending is True
 
     event2 = _final_transcript(pipeline, "Maybe.", 2)
-    await pipeline._handle_stt_event(event2)
+    await _feed(pipeline, event2)
 
     # No submission.
     reqs = controller.state.captured_requests
@@ -517,7 +528,7 @@ async def test_practice_information_rag() -> None:
     pipeline._interpret_utterance = mock_interpret
 
     event = _final_transcript(pipeline, "What time does the practice open on Monday?", 1)
-    await pipeline._handle_stt_event(event)
+    await _feed(pipeline, event)
 
     # Verify the retriever was called with the practice ID.
     pipeline._retriever.retrieve.assert_called_once()
@@ -561,7 +572,7 @@ async def test_conversation_state_isolation_between_sessions() -> None:
     pipeline1._interpret_utterance = mock_interpret1
 
     event1 = _final_transcript(pipeline1, "I want an appointment on Tuesday morning.", 1)
-    await pipeline1._handle_stt_event(event1)
+    await _feed(pipeline1, event1)
 
     controller1 = ConversationController(pipeline1.session.conversation_state)
     assert controller1.state.confirmation_pending is True

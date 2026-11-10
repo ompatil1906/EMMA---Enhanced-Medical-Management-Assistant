@@ -195,7 +195,10 @@ class TestConversationController:
         controller = ConversationController()
         decision = controller.handle_backend_failure("rejected by backend")
         assert decision.action == "error"
-        assert "registered with our clinic reception" in decision.response_text.lower() or "wasn't able to submit" in decision.response_text.lower()
+        assert (
+            "registered with our clinic reception" in decision.response_text.lower()
+            or "wasn't able to submit" in decision.response_text.lower()
+        )
         assert "not a confirmed" not in decision.response_text.lower()
 
 

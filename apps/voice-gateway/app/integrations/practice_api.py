@@ -57,6 +57,12 @@ def build_request_idempotency_key(
     return str(digest)
 
 
+def build_summary_idempotency_key(*, practice_id: str, call_id: str) -> str:
+    """Deterministic key for one call's summary (one summary per call)."""
+    digest = uuid.uuid5(uuid.NAMESPACE_URL, f"{practice_id}|{call_id}|call-summary")
+    return str(digest)
+
+
 class PracticeApiClient:
     """Small, bounded HTTP client; every method returns a structured outcome."""
 
@@ -152,6 +158,31 @@ class PracticeApiClient:
         if call_id:
             payload["callId"] = call_id
         return await self._post("/api/v1/handoffs", payload, retryable=False, op="submit_handoff")
+
+    async def submit_call_summary(
+        self,
+        *,
+        practice_id: str,
+        call_id: str,
+        idempotency_key: str,
+        summary_payload: dict[str, Any],
+    ) -> SubmissionOutcome:
+        """Store the end-of-call summary (which also syncs the Jira record).
+
+        Idempotent server-side on `Idempotency-Key`, so a retry can never create a
+        second summary or a second Jira issue. Never claims persistence unless the
+        API returned the created record.
+        """
+        if not self._base_url:
+            return SubmissionOutcome(status="disabled", detail="PRACTICE_API_BASE_URL unset")
+        payload: dict[str, Any] = {"practiceId": practice_id, **summary_payload}
+        return await self._post(
+            f"/api/v1/calls/{call_id}/summary",
+            payload,
+            retryable=True,
+            op="submit_call_summary",
+            headers={"Idempotency-Key": idempotency_key},
+        )
 
     async def append_audit_event(
         self,

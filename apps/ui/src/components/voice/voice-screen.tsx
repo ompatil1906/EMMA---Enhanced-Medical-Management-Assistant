@@ -61,6 +61,9 @@ export function VoiceScreen() {
   const pipelineRef = useRef<AudioPipelineHandle | null>(null);
   const transportRef = useRef<VoiceTransport | null>(null);
   const levelTimerRef = useRef<number | null>(null);
+  /* Intake identity must reach the transport synchronously: `setCallerData`
+     only lands on the next render, and the session starts immediately. */
+  const callerRef = useRef<IntakeFormData | null>(null);
 
   /* ── helpers ────────────────────────────────────────────────────── */
   const setVoiceStateTracked = (next: VoiceState) => {
@@ -175,14 +178,20 @@ export function VoiceScreen() {
       }
       pipelineRef.current = livePipeline;
 
+      const caller = callerRef.current;
       let transport: VoiceTransport;
       if (VOICE_TRANSPORT === "livekit") {
         transport = createLiveKitTransport({
           baseUrl: GATEWAY_URL.replace(/^ws/, "http").replace(/^wss/, "https"),
           roomName: LIVEKIT_ROOM_NAME,
+          caller,
         });
       } else {
-        transport = createGatewayTransport({ url: GATEWAY_URL, pipeline: livePipeline });
+        transport = createGatewayTransport({
+          url: GATEWAY_URL,
+          pipeline: livePipeline,
+          callerFirstName: caller?.firstName,
+        });
       }
       beginSession(transport);
     } else {
@@ -205,6 +214,7 @@ export function VoiceScreen() {
 
   /* ── user clicks "Call Now" on intake form ──────────────────────── */
   const handleCallNow = (data: IntakeFormData) => {
+    callerRef.current = data;
     setCallerData(data);
     setPhase("calling");
     void startSession("live");

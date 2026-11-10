@@ -22,6 +22,7 @@ from typing import Final, Literal
 from app.domain.audio import AudioFormat
 from app.domain.fsm import TransitionReason, VoiceState, VoiceStateMachine
 from app.domain.speech import FinalTranscript, PartialTranscript
+from app.services.caller_identity import CallerIdentity
 from app.services.conversation.conversation_controller import ConversationState
 
 
@@ -95,6 +96,7 @@ class SpeechSession:
         "turns_completed",
         "cleanup_done",
         "conversation_state",
+        "caller",
     )
 
     def __init__(
@@ -104,6 +106,7 @@ class SpeechSession:
         call_sid: str | None = None,
         practice_id: str | None = None,
         audio_format: AudioFormat,
+        caller: CallerIdentity | None = None,
     ) -> None:
         self.session_id: str = session_id
         self.call_sid: str | None = call_sid
@@ -123,6 +126,9 @@ class SpeechSession:
         self.turns_completed: int = 0
         self.cleanup_done: bool = False
         self.conversation_state: ConversationState = ConversationState()
+        # Intake identity (never spoken in full; only `first_name` is used for
+        # the greeting, the rest feeds the call record + Jira summary).
+        self.caller: CallerIdentity | None = caller
 
     # --- format locking -----------------------------------------------------
 
@@ -180,6 +186,7 @@ class SpeechSession:
             "session_id": self.session_id,
             "call_sid": self.call_sid,
             "practice_id": self.practice_id,
+            "caller_named": bool(self.caller and self.caller.first_name),
             "voice_state": self.voice_state.value,
             "stt_state": self.stt_state.value,
             "tts_state": self.tts_state.value,

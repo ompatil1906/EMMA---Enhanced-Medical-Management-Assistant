@@ -32,6 +32,7 @@ from app.domain.speech import FinalTranscript
 from app.domain.speech_session import SpeechSession
 from app.integrations.llm.base import LLMRequest, LLMResponse
 from app.integrations.practice_api import SubmissionOutcome
+from app.services.caller_identity import CallerIdentity
 from app.services.retrieval.citation_validator import CitationValidationResult
 from app.services.retrieval.knowledge_answer_service import (
     GroundedAnswer,
@@ -101,11 +102,33 @@ class SingleProviderFactory:
 
 
 class FakePracticeClient:
-    """Record submissions and return scripted backend outcomes."""
+    """Record submissions and return scripted backend outcomes.
+
+    Day 19 additions record the call registration and end-of-call summary so the
+    summary tests can assert exactly what the pipeline submits (and what it
+    deliberately does not).
+    """
 
     def __init__(self, outcomes: tuple[str, ...] = ()) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.call_records: list[dict[str, Any]] = []
+        self.summaries: list[dict[str, Any]] = []
         self._outcomes = list(outcomes)
+        self.summary_delay_seconds = 0.0
+
+    async def submit_call(self, **kwargs: Any) -> SubmissionOutcome:
+        self.call_records.append(dict(kwargs))
+        return SubmissionOutcome(
+            status="confirmed", detail="confirmed", record_id="call-eval-record"
+        )
+
+    async def submit_call_summary(self, **kwargs: Any) -> SubmissionOutcome:
+        if self.summary_delay_seconds:
+            await asyncio.sleep(self.summary_delay_seconds)
+        self.summaries.append(dict(kwargs))
+        return SubmissionOutcome(
+            status="confirmed", detail="confirmed", record_id="summary-eval-record"
+        )
 
     async def submit_request(self, **kwargs: Any) -> SubmissionOutcome:
         self.calls.append(dict(kwargs))
@@ -250,6 +273,7 @@ async def make_pipeline(
     answer_text: str = DEFAULT_ANSWER,
     settings_overrides: dict[str, object] | None = None,
     session_id: str | None = None,
+    caller: CallerIdentity | None = None,
 ) -> Harness:
     """Build and start one pipeline with deterministic test doubles."""
     settings = eval_settings(**(settings_overrides or {}))
@@ -258,6 +282,7 @@ async def make_pipeline(
         call_sid=f"call-{uuid.uuid4().hex[:10]}",
         practice_id=practice_id,
         audio_format=AudioFormat(sample_rate=8000, channels=1),
+        caller=caller,
     )
     stt = MockSpeechToTextProvider(script=["unused"], finalize_ms=10, utterance_ms=1000)
     tts = MockTextToSpeechProvider()
@@ -275,6 +300,7 @@ async def make_pipeline(
         llm_factory=SingleProviderFactory(llm),
         retriever=retriever,
         knowledge_answer_service=answer_service,
+        caller=caller,
     )
     await pipeline.start()
     harness = Harness(

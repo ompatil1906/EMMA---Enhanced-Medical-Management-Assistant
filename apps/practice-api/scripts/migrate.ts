@@ -10,6 +10,7 @@
 import 'reflect-metadata';
 import { DataSource } from 'typeorm';
 import { CreateSchema1794000000000 } from '../migrations/1794000000000-CreateSchema.js';
+import { CreateCallSummaries1795000000000 } from '../migrations/1795000000000-CreateCallSummaries.js';
 import {
   cliRegistry,
   ConfigError,
@@ -28,7 +29,7 @@ async function run(): Promise<number> {
 
   const dataSource = new DataSource({
     ...createCliDataSourceOptions(),
-    migrations: [CreateSchema1794000000000],
+    migrations: [CreateSchema1794000000000, CreateCallSummaries1795000000000],
     entities: cliRegistry().entities,
     migrationsTableName: 'schema_migrations',
     synchronize: false,

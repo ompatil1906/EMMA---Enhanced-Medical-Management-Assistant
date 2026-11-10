@@ -24,6 +24,7 @@
 
 import type {
   TranscriptKind,
+  VoiceCaller,
   VoiceEvent,
   VoiceMetrics,
   VoiceSessionContext,
@@ -87,12 +88,16 @@ interface LiveKitTransportOptions {
   baseUrl: string;
   /** Room name to join. */
   roomName: string;
+  /** Intake identity from the form (Day 19). Sent once with the token request so
+      the agent can greet the caller by name; the first name is the only field
+      that reaches the room. */
+  caller?: VoiceCaller | null;
 }
 
 export function createLiveKitTransport(
   options: LiveKitTransportOptions,
 ): VoiceTransport {
-  const { baseUrl, roomName } = options;
+  const { baseUrl, roomName, caller } = options;
 
     let room: any = null;
     let clientMod: LiveKitClientModule | null = null;
@@ -205,7 +210,10 @@ export function createLiveKitTransport(
       const tokenRes = await fetch(`${baseUrl}/api/voice/token`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ room_name: roomName }),
+        body: JSON.stringify({
+          room_name: roomName,
+          caller: caller ?? undefined,
+        }),
       });
 
       if (!tokenRes.ok) {

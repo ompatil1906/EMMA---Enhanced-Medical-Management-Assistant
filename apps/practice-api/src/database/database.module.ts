@@ -3,17 +3,23 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { APP_CONFIG, AppConfig, buildAppConfig } from '../config/app-config.js';
 import { AuditEventEntity } from '../entities/audit-event.entity.js';
 import { CallEntity } from '../entities/call.entity.js';
+import { CallSummaryEntity } from '../entities/call-summary.entity.js';
 import { HandoffEntity } from '../entities/handoff.entity.js';
 import { PatientRequestEntity } from '../entities/patient-request.entity.js';
 import { PracticeEntity } from '../entities/practice.entity.js';
 import { CreateSchema1794000000000 } from '../../migrations/1794000000000-CreateSchema.js';
+import { CreateCallSummaries1795000000000 } from '../../migrations/1795000000000-CreateCallSummaries.js';
 import { Constructable, createDataSourceOptions } from './db-config.js';
 
-export const SCHEMA_MIGRATIONS: Constructable[] = [CreateSchema1794000000000];
+export const SCHEMA_MIGRATIONS: Constructable[] = [
+  CreateSchema1794000000000,
+  CreateCallSummaries1795000000000,
+];
 
 export const APP_ENTITIES: Constructable[] = [
   PracticeEntity,
   CallEntity,
+  CallSummaryEntity,
   PatientRequestEntity,
   HandoffEntity,
   AuditEventEntity,

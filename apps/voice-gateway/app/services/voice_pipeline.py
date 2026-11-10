@@ -51,9 +51,17 @@ from app.domain.speech import (
 )
 from app.domain.speech_session import MediaFormatChangedError, ProviderState
 from app.services.audio_framer import OutboundAudioFramer
+from app.services.caller_identity import CallerIdentity
 from app.services.conversation.conversation_controller import (
     ControllerDecision,
     ConversationController,
+)
+from app.services.conversation.general_conversation import (
+    CLINICAL_REFUSAL,
+    GeneralConversationService,
+    detect_small_talk,
+    is_clinical_question,
+    looks_like_general_question,
 )
 from app.services.conversation.intent_interpreter import IntentInterpretationError
 from app.services.metrics import SessionMetrics
@@ -70,7 +78,14 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+# Identity/capability questions (word-boundary matched; see `_process_turn`).
+_IDENTITY_QUERY_RE = re.compile(
+    r"\b(who are you|what are you|what is emma|what can you do|tell me about yourself|medical ai)\b"
+)
 _OUTBOUND_END: object = object()
+# How long teardown will wait for a still-in-flight call-record registration
+# before giving up on the summary (bounded; never blocks a hanging call).
+_SUMMARY_TASK_GRACE_SECONDS = 1.0
 _LOW_CONFIDENCE_THRESHOLD = 0.5  # below → treat utterance as unclear (deterministic policy)
 
 
@@ -116,6 +131,7 @@ class VoicePipeline:
         retriever: Retriever | None = None,
         knowledge_answer_service: KnowledgeAnswerService | None = None,
         control_events: bool = False,
+        caller: CallerIdentity | None = None,
     ) -> None:
         self.session = session
         self._stt = stt
@@ -128,6 +144,20 @@ class VoicePipeline:
         self._retriever = retriever
         self._knowledge_answer_service = knowledge_answer_service
         self._control_events = control_events
+        # Day 19: intake identity. Only the sanitised first name is spoken; the
+        # full record is attached to the session for the call summary.
+        self._caller = caller or getattr(session, "caller", None)
+        self._greeting_name = self._caller.first_name if self._caller else None
+        if self._caller is not None and getattr(session, "caller", None) is None:
+            session.caller = self._caller
+        # Day 19: everyday conversation (built lazily; never required for a call).
+        self._general_service: GeneralConversationService | None = None
+        self._general_service_ready = False
+        # --- Day 19: call record + deterministic summary ----------------------
+        self._emergency_matched = False
+        self._call_record_id: str | None = None
+        self._call_record_task: asyncio.Task[None] | None = None
+        self._summary_submitted = False
         self._metrics = SessionMetrics(session_id=session.session_id, call_sid=session.call_sid)
         self._framer = OutboundAudioFramer(session.session_id)
         self._outbound_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -153,8 +183,11 @@ class VoicePipeline:
         self._metrics.note_transition()
         await self._start_stt()
         self._stt_task = asyncio.create_task(self._consume_stt_events(), name="stt-events")
+        # Register the call record in the background: it must never delay the
+        # greeting, and it must never block the audio path.
+        self._call_record_task = asyncio.create_task(self._register_call_record())
 
-        greeting = await self._response_handler.greeting()
+        greeting = await self._response_handler.greeting(first_name=self._greeting_name)
         # Greeting path: CONNECTING→SPEAKING (greeting_started) → LISTENING
         # (greeting_completed) — the LISTENING state is reached inside `_speak`.
         await self._speak(
@@ -252,7 +285,117 @@ class VoicePipeline:
         )
         self.session.begin_cleanup()
         self._outbound_queue.put_nowait(_OUTBOUND_END)
+
+        # Day 19: hand the call record + summary to the practice backend (which
+        # mirrors it to the external task platform). Strictly bounded and
+        # best-effort: it can neither block teardown nor turn into a spoken or
+        # logged claim of persistence.
+        await self._submit_call_summary_bounded(fatal=fatal)
         self._metrics.emit()
+
+    # --- Day 19: call record + summary -------------------------------------------------
+
+    async def _register_call_record(self) -> None:
+        """Create/fetch the practice call record (idempotent, best-effort)."""
+        if not (self._practice_client and self._practice_id):
+            return
+        from app.integrations.practice_api import SubmissionOutcome
+
+        external_call_id = self.session.call_sid or self.session.session_id
+        try:
+            outcome = await asyncio.wait_for(
+                self._practice_client.submit_call(
+                    practice_id=self._practice_id, external_call_id=external_call_id
+                ),
+                timeout=self._settings.PRACTICE_API_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — registration is best-effort
+            outcome = SubmissionOutcome(status="unavailable", detail=type(exc).__name__)
+        self._metrics.note_practice_outcome("submit_call", outcome.status)
+        if outcome.confirmed and outcome.record_id:
+            self._call_record_id = outcome.record_id
+            return
+        logger.warning(
+            "call record not registered; call summary will be skipped",
+            extra={"session_id": self.session.session_id, "status": outcome.status},
+        )
+
+    async def _submit_call_summary_bounded(self, *, fatal: bool) -> None:
+        """Submit the deterministic summary under a hard timeout.
+
+        Skipped when: summaries are disabled, the call had no practice record, no
+        practice backend is configured, the summary was already submitted, or the
+        emergency guard matched (zero administrative actions on emergency).
+        """
+        if self._summary_submitted:
+            return
+        if not getattr(self._settings, "CALL_SUMMARY_ENABLED", True):
+            return
+        if self._emergency_matched:
+            self._metrics.note_practice_outcome("call_summary", "skipped_emergency")
+            return
+        if not (self._practice_client and self._practice_id):
+            return
+        self._summary_submitted = True
+
+        # Wait (briefly) for the call record so the summary has a parent row.
+        if self._call_record_task is not None and not self._call_record_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._call_record_task), timeout=_SUMMARY_TASK_GRACE_SECONDS
+                )
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:  # noqa: BLE001 — registration never raises here
+                pass
+
+        if not self._call_record_id:
+            self._metrics.note_practice_outcome("call_summary", "skipped_no_call_record")
+            return
+
+        from app.integrations.practice_api import (
+            SubmissionOutcome,
+            build_summary_idempotency_key,
+        )
+        from app.services.call_summary import build_call_summary
+
+        summary = build_call_summary(
+            conversation=self.session.conversation_state,
+            caller=self._caller,
+            outcome="emergency"
+            if self._emergency_matched
+            else ("failed" if fatal else "completed"),
+            started_at=self.session.started_at,
+            include_transcript=bool(
+                getattr(self._settings, "CALL_SUMMARY_INCLUDE_TRANSCRIPT", False)
+            ),
+        )
+        key = build_summary_idempotency_key(
+            practice_id=self._practice_id, call_id=self._call_record_id
+        )
+        timeout = min(
+            float(getattr(self._settings, "CALL_SUMMARY_TIMEOUT", 2.0)),
+            float(self._settings.PRACTICE_API_TIMEOUT),
+        )
+        try:
+            outcome = await asyncio.wait_for(
+                self._practice_client.submit_call_summary(
+                    practice_id=self._practice_id,
+                    call_id=self._call_record_id,
+                    idempotency_key=key,
+                    summary_payload=summary.to_payload(),
+                ),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            outcome = SubmissionOutcome(status="timeout", detail="call summary timed out")
+        except Exception as exc:  # noqa: BLE001 — teardown must never raise
+            outcome = SubmissionOutcome(status="unavailable", detail=type(exc).__name__)
+        self._metrics.note_practice_outcome("call_summary", outcome.status)
+        logger.info(
+            "call summary submitted",
+            extra={"session_id": self.session.session_id, "status": outcome.status},
+        )
 
     # --- STT event consumption --------------------------------------------------------
 
@@ -338,12 +481,15 @@ class VoicePipeline:
     # --- Day 5/9 turn processing -------------------------------------------------
 
     async def _process_turn(self, utterance: FinalTranscript) -> None:
-        """Process one final transcript through guard → LLM → controller.
+        """Process one final transcript through guard → conversation → controller.
 
-        Flow: emergency guard → LLM interpretation (with bounded dialogue
-        context) → Pydantic validation → deterministic confirmation/correction
-        handling → conversation controller → response/TTS → (optional) backend
-        submission. The FSM remains the authority for call state.
+        Flow: emergency guard (always first) → deterministic clinical refusal →
+        everyday small talk → deterministic slot fill / LLM interpretation (with
+        bounded dialogue context) → Pydantic validation → deterministic
+        confirmation/correction handling → conversation controller →
+        response/TTS → (optional) backend submission. Practice questions go to
+        RAG; non-practice questions may fall back to general knowledge (never the
+        other way round). The FSM remains the authority for call state.
 
         Day 9: serialised per session via `_turn_lock`; duplicate/out-of-order
         turns are rejected; barge-in cancels in-flight TTS; turns are recorded
@@ -380,14 +526,22 @@ class VoicePipeline:
             # Fast-path greetings without waiting on an LLM round-trip
             norm_text = utterance.text.strip().lower().rstrip("!.,")
             if (
-                norm_text in {"hi", "hello", "hey", "hiya", "good morning", "good afternoon", "good evening", "howdy"}
+                norm_text
+                in {
+                    "hi",
+                    "hello",
+                    "hey",
+                    "hiya",
+                    "good morning",
+                    "good afternoon",
+                    "good evening",
+                    "howdy",
+                }
                 and not self.session.conversation_state.confirmation_pending
                 and not self.session.conversation_state.awaiting_field
             ):
                 await self._speak(
-                    ConversationDecision(
-                        response_text="Hello! How can I help you today? You can book an appointment, request a prescription, or ask about our clinic opening hours."
-                    ),
+                    await self._response_handler.greet_again(self._greeting_name),
                     enter_reason=TransitionReason.RESPONSE_STARTED,
                     exit_reason=TransitionReason.RESPONSE_COMPLETED,
                     utterance_id=turn_id,
@@ -395,18 +549,21 @@ class VoicePipeline:
                 self._metrics.note_turn_complete()
                 return
 
-            # Fast-path identity and capabilities
+            # Fast-path identity and capabilities.
+            # Word-boundary matching only: a substring test made "what are you"
+            # match "what are your opening hours?" and answered the wrong question.
             if (
-                any(k in norm_text for k in ("who are you", "what are you", "medical ai", "what can you do", "tell me about yourself", "about the medical ai", "what is emma"))
+                _IDENTITY_QUERY_RE.search(norm_text)
                 and not self.session.conversation_state.confirmation_pending
                 and not self.session.conversation_state.awaiting_field
             ):
                 await self._speak(
                     ConversationDecision(
                         response_text=(
-                            "I am EMMA, your Enhanced Medical Management Assistant built by QuantumLoopAI. "
-                            "I can assist you with scheduling clinic appointments, requesting repeat prescriptions, "
-                            "or checking our clinic operating hours. How can I assist you right now?"
+                            "I am EMMA, your Enhanced Medical Management Assistant built by "
+                            "QuantumLoopAI. I can assist you with scheduling clinic appointments, "
+                            "requesting repeat prescriptions, or checking our clinic operating "
+                            "hours. How can I assist you right now?"
                         )
                     ),
                     enter_reason=TransitionReason.RESPONSE_STARTED,
@@ -439,6 +596,9 @@ class VoicePipeline:
             # --- 1. Emergency guard (pre-LLM, always) ---------------------------
             guard = emergency_guard(utterance.text)
             if guard.matched:
+                # Emergency calls take no administrative action at all — this
+                # also suppresses the end-of-call summary submission.
+                self._emergency_matched = True
                 self._metrics.note_provider_error("safety", guard.rule_id, fatal=False)
                 # Emergency invalidates all pending ordinary actions and must
                 # never reach the LLM, embeddings, Qdrant, or the backend.
@@ -451,6 +611,38 @@ class VoicePipeline:
                 )
                 self._metrics.note_turn_complete()
                 return
+
+            # --- 1a. Clinical questions: deterministic refusal, no model -------
+            # Never delegated to the LLM, never answered from world knowledge.
+            # Runs after the emergency guard (so 999 always wins) and before any
+            # interpretation or retrieval call.
+            if is_clinical_question(utterance.text):
+                await self._speak(
+                    ConversationDecision(response_text=CLINICAL_REFUSAL),
+                    enter_reason=TransitionReason.RESPONSE_STARTED,
+                    exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                    utterance_id=turn_id,
+                )
+                self._metrics.note_turn_complete()
+                return
+
+            # --- 1b. Everyday conversation (never inside slot filling) --------
+            # Social turns are answered deterministically here — before any LLM
+            # call — but only when no administrative flow is in flight. The
+            # emergency guard above always runs first.
+            if not self.session.conversation_state.confirmation_pending and not (
+                self.session.conversation_state.awaiting_field
+            ):
+                small_talk = detect_small_talk(utterance.text)
+                if small_talk is not None:
+                    await self._speak(
+                        ConversationDecision(response_text=small_talk.response_text),
+                        enter_reason=TransitionReason.RESPONSE_STARTED,
+                        exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                        utterance_id=turn_id,
+                    )
+                    self._metrics.note_turn_complete()
+                    return
 
             # --- 2. Deterministic slot fill, then LLM interpretation ----------
             # A short explicit answer to "what date/time?" is filled by the
@@ -466,6 +658,7 @@ class VoicePipeline:
                 except IntentInterpretationError as exc:
                     if exc.emergency:
                         # Should not happen (guard runs first), but handle defensively.
+                        self._emergency_matched = True
                         controller.handle_emergency()
                         await self._speak(
                             ConversationDecision(
@@ -558,6 +751,16 @@ class VoicePipeline:
         if self._is_practice_information_request(result, utterance.text):
             return ControllerDecision(action="rag", response_text="")
 
+        # General (non-practice) question with no administrative content → the
+        # everyday-knowledge path. Practice questions never reach this branch
+        # (RAG above), and the emergency guard ran before the LLM.
+        if (
+            not ConversationController.has_admin_request(result)
+            and result.intent in ("other", "unclear")
+            and looks_like_general_question(utterance.text)
+        ):
+            return ControllerDecision(action="general", response_text="")
+
         return controller.handle_interpretation(result)
 
     async def _apply_decision(
@@ -580,6 +783,8 @@ class VoicePipeline:
             await self._submit_confirmed_handoff(decision)
         elif decision.action == "rag":
             await self._handle_practice_information(decision, utterance, turn_id=turn_id)
+        elif decision.action == "general":
+            await self._handle_general_question(utterance, turn_id=turn_id)
         else:
             # clarify / confirm / cancel / error / emergency → speak.
             await self._speak(
@@ -722,18 +927,18 @@ class VoicePipeline:
         )
 
         if not (self._practice_client and self._practice_id):
-            controller = ConversationController(self.session.conversation_state)
+            # No practice backend configured: nothing was submitted. Say exactly
+            # that — the previous wording claimed a registration that never
+            # happened (honesty invariant: no persistence claim without a 2xx).
             payload = decision.backend_payload or {}
             requests = payload.get("requests", [])
-            for i, req in enumerate(requests):
-                rtype = str(req.get("requestType", "unknown"))
-                controller.handle_backend_success(request_type=rtype, idempotency_key=f"prod-{turn_id or 'turn'}-{i}")
             plural = "requests" if len(requests) > 1 else "request"
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        f"Thank you! Your {plural} has been successfully confirmed and registered with our medical reception team. "
-                        "Is there anything else I can assist you with today?"
+                        f"I've got the details for your {plural}, but the practice system "
+                        "isn't available right now, so nothing has been sent. Please "
+                        "contact the practice directly to complete it."
                     )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
@@ -768,7 +973,7 @@ class VoicePipeline:
                         idempotency_key=key,
                         request_type=request_type,
                         structured_payload=req.get("structuredPayload", {}),
-                        call_id=self.session.call_sid,
+                        call_id=self._call_record_id,
                     ),
                     timeout=self._settings.PRACTICE_API_TIMEOUT,
                 )
@@ -837,7 +1042,10 @@ class VoicePipeline:
         if not (self._retriever and self._knowledge_answer_service):
             await self._speak(
                 ConversationDecision(
-                    response_text="Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. How can I help you today?"
+                    response_text=(
+                        "Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. "
+                        "How can I help you today?"
+                    )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
@@ -862,7 +1070,10 @@ class VoicePipeline:
             self._metrics.note_error(f"retrieval_failed ({type(exc).__name__})")
             await self._speak(
                 ConversationDecision(
-                    response_text="Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. Please let me know if you would like to book an appointment."
+                    response_text=(
+                        "Our clinic is open Monday through Friday from 8:00 AM to 6:30 PM. "
+                        "Please let me know if you would like to book an appointment."
+                    )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
@@ -870,13 +1081,18 @@ class VoicePipeline:
             )
             return
 
-        # If no results found, provide helpful clinic direction
+        # No practice records for this question: if it is a general (non-practice)
+        # question, answer it from everyday knowledge instead of dead-ending.
+        # Practice facts still only ever come from the knowledge base.
         if not retrieval_result.chunks:
+            if await self._speak_general_answer(utterance.text, turn_id=turn_id):
+                return
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        "I don't have specific clinic records on that topic right now, but I can help you book an appointment, "
-                        "request a prescription, or check our opening hours."
+                        "I don't have information about that at the practice, I'm afraid. "
+                        "I can help you book an appointment, request a prescription, "
+                        "or check our opening hours."
                     )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
@@ -898,14 +1114,21 @@ class VoicePipeline:
             await self._speak(
                 ConversationDecision(
                     response_text=(
-                        "Our clinic reception is open Monday through Friday from 8:00 AM to 6:30 PM. "
-                        "How can I assist you today?"
+                        "Our clinic reception is open Monday through Friday from 8:00 AM to "
+                        "6:30 PM. How can I assist you today?"
                     )
                 ),
                 enter_reason=TransitionReason.RESPONSE_STARTED,
                 exit_reason=TransitionReason.RESPONSE_COMPLETED,
                 utterance_id=turn_id,
             )
+            return
+
+        # The knowledge base could not answer (abstained): a general question may
+        # still be answerable from everyday knowledge.
+        if answer_result.answer.abstained and await self._speak_general_answer(
+            utterance.text, turn_id=turn_id
+        ):
             return
 
         # Track RAG context for multi-turn follow-ups.
@@ -925,6 +1148,78 @@ class VoicePipeline:
             exit_reason=TransitionReason.RESPONSE_COMPLETED,
             utterance_id=turn_id,
         )
+
+    # --- everyday conversation (Day 19) -------------------------------------
+
+    def _general_conversation(self) -> GeneralConversationService | None:
+        """Build (once) the general-knowledge service, or None when disabled.
+
+        World knowledge is explicitly opt-out (`GENERAL_CHAT_ENABLED=false`) and
+        unavailable without an LLM factory. A provider that cannot be built is
+        treated as unavailable — never a silent substitution.
+        """
+        if self._general_service_ready:
+            return self._general_service
+        self._general_service_ready = True
+        if not getattr(self._settings, "GENERAL_CHAT_ENABLED", True):
+            return None
+        if self._llm_factory is None:
+            return None
+        try:
+            provider = self._llm_factory.create()
+        except Exception as exc:  # noqa: BLE001 — no provider → templates only
+            logger.warning(
+                "general conversation unavailable",
+                extra={"session_id": self.session.session_id, "detail": type(exc).__name__},
+            )
+            return None
+        self._general_service = GeneralConversationService(
+            llm_provider=provider,
+            model=self._settings.LLM_MODEL,
+            timeout_seconds=self._settings.LLM_TIMEOUT_SECONDS,
+            max_output_tokens=self._settings.LLM_MAX_OUTPUT_TOKENS,
+            prompt_version=self._settings.LLM_PROMPT_VERSION,
+            max_sentences=int(getattr(self._settings, "GENERAL_CHAT_MAX_SENTENCES", 2)),
+        )
+        return self._general_service
+
+    async def _handle_general_question(
+        self, utterance: FinalTranscript, *, turn_id: str | None = None
+    ) -> None:
+        """Speak an everyday-knowledge answer (never an administrative action)."""
+        if not await self._speak_general_answer(utterance.text, turn_id=turn_id):
+            await self._speak(
+                ConversationDecision(
+                    response_text=(
+                        "Sorry, I can't help with that one. I can book or change an "
+                        "appointment, take a repeat prescription request, or answer "
+                        "questions about the practice."
+                    )
+                ),
+                enter_reason=TransitionReason.RESPONSE_STARTED,
+                exit_reason=TransitionReason.RESPONSE_COMPLETED,
+                utterance_id=turn_id,
+            )
+
+    async def _speak_general_answer(self, question: str, *, turn_id: str | None = None) -> bool:
+        """Answer a general question if possible; True when something was spoken."""
+        service = self._general_conversation()
+        if service is None:
+            return False
+        answer = await service.answer(question=question, correlation_id=self.session.session_id)
+        if not answer.text:
+            return False
+        logger.info(
+            "general conversation answer",
+            extra={"session_id": self.session.session_id, "source": answer.source},
+        )
+        await self._speak(
+            ConversationDecision(response_text=answer.text),
+            enter_reason=TransitionReason.RESPONSE_STARTED,
+            exit_reason=TransitionReason.RESPONSE_COMPLETED,
+            utterance_id=turn_id,
+        )
+        return True
 
     # --- multi-turn context helpers -----------------------------------------
 

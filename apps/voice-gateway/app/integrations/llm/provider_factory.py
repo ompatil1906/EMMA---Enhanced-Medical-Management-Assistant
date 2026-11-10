@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 
 from app.integrations.llm.base import LLMProvider
 from app.integrations.llm.exceptions import LLMProviderNotAvailable
-from app.integrations.llm.fallback_provider import FallbackLLMProvider
 from app.integrations.llm.gemini_provider import GeminiLLMProvider
 from app.integrations.llm.mock_provider import MockLLMProvider
 from app.integrations.llm.openai_provider import OpenAILLMProvider

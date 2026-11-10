@@ -50,7 +50,18 @@ _URGENT_DEMO_KEYWORDS = (
 
 _TEST_PHRASES = ("test response", "pipeline test")
 
-_GREETING = "Hello, I am EMMA, your medical practice receptionist from QuantumLoopAI. How can I assist you today?"
+_GREETING = (
+    "Hello, I am EMMA, your medical practice receptionist from QuantumLoopAI. "
+    "How can I assist you today?"
+)
+# Day 19: named greeting — spoken when the caller submitted their identity on
+# the intake form. The name is already normalised by `caller_identity`; the
+# generic wording above remains the fallback when no usable name was given.
+_GREETING_NAMED = (
+    "Hello, {first_name}. I am EMMA, your medical practice receptionist from "
+    "QuantumLoopAI. How can I assist you today?"
+)
+_GREETING_AGAIN = "Hello again, {first_name}. How can I help?"
 _CLARIFICATION = (
     "I'm sorry, I didn't quite catch that. You can ask me to book or reschedule an appointment, "
     "request a prescription refill, or ask about our clinic hours."
@@ -87,9 +98,27 @@ class DeterministicResponseHandler:
     def __init__(self) -> None:
         self._greeting_decision = ConversationDecision(response_text=_GREETING)
 
-    async def greeting(self) -> ConversationDecision:
-        """Direct connect-greeting (FSM CONNECTING→SPEAKING path)."""
+    async def greeting(self, first_name: str | None = None) -> ConversationDecision:
+        """Direct connect-greeting (FSM CONNECTING→SPEAKING path).
+
+        `first_name` is an already-sanitised intake name. It is optional so the
+        generic greeting stays the default contract (and the fallback whenever
+        the caller submitted nothing usable).
+        """
+        if first_name:
+            return ConversationDecision(response_text=_GREETING_NAMED.format(first_name=first_name))
         return self._greeting_decision
+
+    async def greet_again(self, first_name: str | None = None) -> ConversationDecision:
+        """Short greeting for a caller who says "hello" mid-call."""
+        if first_name:
+            return ConversationDecision(response_text=_GREETING_AGAIN.format(first_name=first_name))
+        return ConversationDecision(
+            response_text=(
+                "Hello! How can I help you today? You can book an appointment, "
+                "request a prescription, or ask about our clinic opening hours."
+            )
+        )
 
     async def respond(self, *, utterance: str) -> ConversationDecision:
         """Map one FINAL utterance to the fixed Day-3 pipeline response."""

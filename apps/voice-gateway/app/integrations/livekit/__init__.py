@@ -24,6 +24,7 @@ No credentials → the module is importable but agent construction raises
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import timedelta
@@ -119,11 +120,18 @@ class LiveKitTokenMinter:
         participant_identity: str,
         practice_id: str,
         ttl_seconds: int = 3600,
+        participant_name: str | None = None,
+        caller_first_name: str | None = None,
     ) -> str:
         """Mint a LiveKit access token for a browser participant.
 
         The `practice_id` is bound server-side and embedded in the token
         metadata; the browser cannot alter it.
+
+        Day 19: the intake first name (already sanitised by the route) travels in
+        the participant `name` and in the metadata JSON so the agent can greet
+        the caller by name. The participant *identity* stays opaque
+        (`emma-caller-<hex>`) — no PII in identities, room names or logs.
 
         Returns a JWT string that the browser passes to `LiveKitClient.connect()`.
         """
@@ -134,7 +142,16 @@ class LiveKitTokenMinter:
                 self._settings.LIVEKIT_API_SECRET,
             )
             .with_identity(participant_identity)
-            .with_name("EMMA Caller")
+            .with_name(participant_name or caller_first_name or "EMMA Caller")
+            .with_metadata(
+                json.dumps(
+                    {
+                        "practice_id": practice_id,
+                        "first_name": caller_first_name,
+                    },
+                    separators=(",", ":"),
+                )
+            )
             .with_ttl(timedelta(seconds=ttl_seconds))
             .with_grants(
                 api.VideoGrants(
@@ -146,8 +163,6 @@ class LiveKitTokenMinter:
                 )
             )
         )
-        # Embed practice identity as metadata (server-trusted).
-        token.metadata = practice_id
         return token.to_jwt()
 
 

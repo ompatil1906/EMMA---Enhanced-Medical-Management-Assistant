@@ -1,5 +1,6 @@
 import { Constructable } from '../src/database/db-config.js';
 import { CreateSchema1794000000000 } from '../migrations/1794000000000-CreateSchema.js';
+import { CreateCallSummaries1795000000000 } from '../migrations/1795000000000-CreateCallSummaries.js';
 
 /** CLI database settings duplicate the runtime env contract, decorator-free. */
 export interface CliDatabaseConfig {
@@ -30,7 +31,10 @@ export function readCliDatabaseConfig(): CliDatabaseConfig {
 }
 
 export function cliRegistry(): DataSourceRegistry {
-  const migrations: Constructable[] = [CreateSchema1794000000000];
+  const migrations: Constructable[] = [
+    CreateSchema1794000000000,
+    CreateCallSummaries1795000000000,
+  ];
   return { entities: [], migrations };
 }
 

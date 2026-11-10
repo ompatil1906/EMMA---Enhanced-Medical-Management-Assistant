@@ -25,6 +25,18 @@ export type VoiceState =
 
 export type VoiceMode = "live" | "demo";
 
+/** Intake-form identity submitted before the call starts (Day 19).
+
+   Only the first name is used to greet the caller ("Hello, Sarah."). The rest
+   is sent once, at call start, for the practice record — it never appears in a
+   URL, an identity, or audio. The gateway re-sanitises every field. */
+export interface VoiceCaller {
+  firstName: string;
+  lastName: string;
+  mobile: string;
+  reason: string;
+}
+
 export interface VoiceMetrics {
   /** media frames sent to the gateway */
   framesIn: number;

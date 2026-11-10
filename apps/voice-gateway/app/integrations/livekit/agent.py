@@ -41,6 +41,7 @@ from app.core.config import Settings
 from app.domain.audio import AudioFormat
 from app.domain.events import AudioReceived
 from app.integrations.livekit import LiveKitAgent
+from app.services.caller_identity import CallerIdentity, first_name_from_participant
 from app.services.voice_pipeline import VoicePipeline
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,24 @@ def _first_caller_identity(room: Any) -> str | None:
     return None
 
 
+def _caller_identity(room: Any, identity: str | None) -> CallerIdentity | None:
+    """Build the sanitisd intake identity for the first caller in the room.
+
+    The browser form's first name arrives on the participant name/metadata (set
+    server-side by the token endpoint). Absent or unusable → None, and the
+    greeting falls back to the generic wording.
+    """
+    target = identity or _first_caller_identity(room)
+    if target is None:
+        return None
+    for participant in list(getattr(room, "remote_participants", {}).values()):
+        if getattr(participant, "identity", None) != target:
+            continue
+        first_name = first_name_from_participant(participant)
+        return CallerIdentity(first_name=first_name) if first_name else None
+    return None
+
+
 async def entrypoint(ctx: Any) -> None:
     """LiveKit agent entrypoint.
 
@@ -413,17 +432,20 @@ async def entrypoint(ctx: Any) -> None:
     state.llm_factory = LLMProviderFactory(settings)
 
     session: EmmaAgentSession | None = None
+    caller_identity: str | None = None
 
     async def _launch_session() -> None:
         nonlocal session
         if session is not None:
             return
         audio_format = AudioFormat(sample_rate=16000, channels=1)
+        caller = _caller_identity(room, caller_identity)
         speech_session = SpeechSession(
             session_id=ctx.job.id,
             call_sid=ctx.job.id,
             practice_id=settings.PRACTICE_ID or "demo-practice-001",
             audio_format=audio_format,
+            caller=caller,
         )
 
         retriever = None
@@ -461,6 +483,7 @@ async def entrypoint(ctx: Any) -> None:
             knowledge_answer_service=knowledge_answer_service,
             llm_factory=state.llm_factory,
             control_events=True,
+            caller=caller,
         )
 
         session = EmmaAgentSession(ctx=ctx, settings=settings, pipeline=pipeline)
@@ -473,6 +496,7 @@ async def entrypoint(ctx: Any) -> None:
     # Launch for a caller that already exists; otherwise wait for the first.
     first = _first_caller_identity(room)
     if first is not None:
+        caller_identity = first
         logger.info(
             "caller already in room at dispatch",
             extra={"session_id": ctx.job.id, "caller": first},
@@ -491,14 +515,16 @@ async def entrypoint(ctx: Any) -> None:
                 waiter.set_result(identity)
 
         room.on("participant_connected")(_on_participant)
-        if _first_caller_identity(room) is not None:
-            first = _first_caller_identity(room)
+        existing = _first_caller_identity(room)
+        if existing is not None:
+            first = existing
         else:
             logger.info(
                 "waiting for caller participant",
                 extra={"session_id": ctx.job.id},
             )
             first = await asyncio.wait_for(waiter, timeout=None)
+        caller_identity = first
         await _launch_session()
 
     # Keep the session alive until the room disconnects.

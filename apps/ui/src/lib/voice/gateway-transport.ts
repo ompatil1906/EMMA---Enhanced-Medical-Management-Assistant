@@ -81,12 +81,15 @@ export interface GatewayTransportOptions {
   /** WebSocket endpoint, e.g. ws://localhost:8000/ws/exotel (no query params). */
   url: string;
   pipeline: AudioPipelineHandle;
+  /** Intake first name (Day 19) so EMMA greets the caller by name. Only the
+      first name is sent, as a query parameter; nothing else from the form. */
+  callerFirstName?: string;
 }
 
 export function createGatewayTransport(
   options: GatewayTransportOptions,
 ): VoiceTransport {
-  const { url, pipeline } = options;
+  const { url, pipeline, callerFirstName } = options;
 
   let ws: WebSocket | null = null;
   let player: PcmPlayerHandle | null = null;
@@ -172,7 +175,10 @@ export function createGatewayTransport(
     });
 
     const separator = url.includes("?") ? "&" : "?";
-    const urlWithOptions = `${url}${separator}sample-rate=${SAMPLE_RATE}&control-events=1`;
+    const nameParam = callerFirstName?.trim()
+      ? `&caller-first-name=${encodeURIComponent(callerFirstName.trim())}`
+      : "";
+    const urlWithOptions = `${url}${separator}sample-rate=${SAMPLE_RATE}&control-events=1${nameParam}`;
 
     let socket: WebSocket;
     try {

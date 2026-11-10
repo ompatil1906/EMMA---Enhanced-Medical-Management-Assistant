@@ -79,7 +79,7 @@ describe('persistence constraints (migrations-built schema)', () => {
     await ctx.close();
   });
 
-  it('stores exactly the five domain tables + the migration bookkeeping table', async () => {
+  it('stores exactly the six domain tables + the migration bookkeeping table', async () => {
     const tables = (await ctx.dataSource.query<TableEntry[]>(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
     )) as TableEntry[];
@@ -87,6 +87,7 @@ describe('persistence constraints (migrations-built schema)', () => {
     expect(names).toEqual(
       [
         'audit_events',
+        'call_summaries',
         'calls',
         'handoffs',
         'patient_requests',

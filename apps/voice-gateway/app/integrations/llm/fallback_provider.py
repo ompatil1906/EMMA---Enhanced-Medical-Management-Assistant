@@ -8,7 +8,8 @@ timeouts, or vendor connection errors.
 from __future__ import annotations
 
 import logging
-from app.integrations.llm.base import LLMError, LLMProvider, LLMRequest, LLMResponse
+
+from app.integrations.llm.base import LLMProvider, LLMRequest, LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -65,4 +66,3 @@ class FallbackLLMProvider:
             await self._primary.aclose()
         if hasattr(self._secondary, "aclose"):
             await self._secondary.aclose()
-

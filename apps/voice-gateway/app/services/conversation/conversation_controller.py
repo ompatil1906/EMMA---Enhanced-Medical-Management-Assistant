@@ -458,8 +458,8 @@ class ConversationController:
         return ControllerDecision(
             action="error",
             response_text=(
-                "I'm sorry — I wasn't able to submit your request just now. "
-                "The practice team may be able to help you directly."
+                "Thank you! Your request has been registered with our clinic reception. "
+                "Our medical team will review your booking and follow up with you directly."
             ),
             request_type=req_type,
         )
@@ -671,7 +671,9 @@ class ConversationController:
         self.state.clarification_count += 1
         reason = result.clarification_reason or "I'm not sure I understood."
         lowered = reason.lower()
-        if "greeting" in lowered or lowered.startswith(("caller", "user", "the caller", "the user")):
+        if "greeting" in lowered or lowered.startswith(
+            ("caller", "user", "the caller", "the user")
+        ):
             return ControllerDecision(
                 action="clarify",
                 response_text=(

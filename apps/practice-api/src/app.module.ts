@@ -5,6 +5,7 @@ import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { validateEnv } from './config/env.js';
 import { DatabaseModule } from './database/database.module.js';
+import { JiraModule } from './integrations/jira/jira.module.js';
 import { PracticesModule } from './practices/practices.module.js';
 import { CallsModule } from './calls/calls.module.js';
 import { RequestsModule } from './requests/requests.module.js';
@@ -38,6 +39,7 @@ import { APP_CONFIG, buildAppConfig } from './config/app-config.js';
     RequestsModule,
     HandoffsModule,
     AuditModule,
+    JiraModule,
     HealthModule,
   ],
   providers: [

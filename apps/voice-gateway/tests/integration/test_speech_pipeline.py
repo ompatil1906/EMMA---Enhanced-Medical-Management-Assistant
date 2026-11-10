@@ -181,3 +181,45 @@ async def test_speech_mode_abrupt_disconnect_cleans_registered_session(
         await ws.send(media_message(b"\x03" * 3200))
         await ws.close(code=1001)
     await poll_active_sessions(server_url["http"], expected=0)
+
+
+@pytest.mark.parametrize("server_url", [SPEECH_MODE_PARAMS], indirect=True)
+async def test_speech_mode_greets_the_caller_by_name(server_url: dict[str, str]) -> None:
+    """Day 19: the WebSocket fallback greets the intake form's first name.
+
+    The browser sends `?caller-first-name=sarah`; the gateway sanitises it and
+    EMMA speaks "Hello, Sarah." — proven end to end through the assistant
+    control event, not just at the handler unit level.
+    """
+    url = f"{server_url['ws']}?sample-rate=8000&control-events=1&caller-first-name=sarah"
+    async with connect(url) as ws:
+        await open_stream(ws)
+        first_assistant = None
+        for _ in range(200):
+            reply = await receive_json(ws)
+            if reply.get("event") == "assistant":
+                first_assistant = str(reply.get("text"))
+                break
+        assert first_assistant is not None, "no assistant control event was emitted"
+        assert first_assistant.startswith("Hello, Sarah.")
+        code, reason = await _send_stop_and_expect_clean_close(ws)
+        assert (code, reason) == (1000, "stop")
+
+
+@pytest.mark.parametrize("server_url", [SPEECH_MODE_PARAMS], indirect=True)
+async def test_speech_mode_greeting_is_generic_without_a_name(
+    server_url: dict[str, str],
+) -> None:
+    url = f"{server_url['ws']}?sample-rate=8000&control-events=1"
+    async with connect(url) as ws:
+        await open_stream(ws)
+        first_assistant = None
+        for _ in range(200):
+            reply = await receive_json(ws)
+            if reply.get("event") == "assistant":
+                first_assistant = str(reply.get("text"))
+                break
+        assert first_assistant is not None
+        assert first_assistant.startswith("Hello, I am EMMA")
+        code, reason = await _send_stop_and_expect_clean_close(ws)
+        assert (code, reason) == (1000, "stop")

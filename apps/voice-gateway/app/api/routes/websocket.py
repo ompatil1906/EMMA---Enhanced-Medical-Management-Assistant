@@ -63,6 +63,7 @@ from app.integrations.exotel.schemas import (
     ExotelStop,
     ExotelUnknownEvent,
 )
+from app.services.caller_identity import CallerIdentity, parse_first_name_param
 from app.services.echo_service import EchoService
 
 logger = get_logger(__name__)
@@ -216,6 +217,11 @@ async def exotel_media_stream(websocket: WebSocket) -> None:
     # Provider (Exotel) traffic never sets this, so the verified media protocol
     # stays byte-compatible.
     control_events = websocket.query_params.get("control-events") in ("1", "true", "yes")
+    # Day 19: intake first name from the browser form (sanitised; optional).
+    # Longest-lived transport param in the URL, so it carries the name ONLY —
+    # the rest of the form never travels in a query string.
+    parsed_caller = parse_first_name_param(websocket.query_params.get("caller-first-name"))
+    caller: CallerIdentity | None = parsed_caller if parsed_caller.has_any else None
     state.registry.register(session)
     logger.info(
         "ws session opened",
@@ -224,7 +230,13 @@ async def exotel_media_stream(websocket: WebSocket) -> None:
 
     if settings.VOICE_PIPELINE == "speech":
         exit_close = await _session_loop_speech(
-            websocket, session, state, settings, adapter, control_events=control_events
+            websocket,
+            session,
+            state,
+            settings,
+            adapter,
+            control_events=control_events,
+            caller=caller,
         )
     else:
         exit_close = await _session_loop_echo(websocket, session, settings, adapter, state)
@@ -427,6 +439,7 @@ def _build_speech_pipeline(
     settings: Settings,
     *,
     control_events: bool = False,
+    caller: CallerIdentity | None = None,
 ) -> object:
     """Construct one VoicePipeline from the validated provider factory."""
     from app.domain.speech_session import SpeechSession as _SpeechSession
@@ -443,6 +456,7 @@ def _build_speech_pipeline(
         call_sid=session.call_sid,
         practice_id=settings.PRACTICE_ID,
         audio_format=session.audio_format,
+        caller=caller,
     )
 
     # Build Day-6 retrieval components if configured
@@ -479,6 +493,7 @@ def _build_speech_pipeline(
         knowledge_answer_service=knowledge_answer_service,
         llm_factory=state.llm_factory,
         control_events=control_events,
+        caller=caller,
     )
 
 
@@ -490,6 +505,7 @@ async def _session_loop_speech(
     adapter: ExotelAdapter,
     *,
     control_events: bool = False,
+    caller: CallerIdentity | None = None,
 ) -> tuple[int, str] | None:
     """Speech-pipeline loop: pipeline owns audio; the route stays transport-only."""
     from app.services.voice_pipeline import ControlEvent, PipelineFatallyFailed, VoicePipeline
@@ -608,7 +624,11 @@ async def _session_loop_speech(
                         )
                         try:
                             pipeline = _build_speech_pipeline(
-                                session, state, settings, control_events=control_events
+                                session,
+                                state,
+                                settings,
+                                control_events=control_events,
+                                caller=caller,
                             )
                         except ProviderConfigurationError as exc:
                             logger.error(

@@ -143,6 +143,25 @@ class Settings(BaseSettings):
     # Practice identity for submissions (seeded fictional practice id).
     PRACTICE_ID: str | None = None
 
+    # --- Day 19: everyday conversation -------------------------------------
+    # Everyday small talk is always available (deterministic templates). World
+    # knowledge answers additionally require an LLM provider; disabling this flag
+    # removes that path entirely (templates + practice RAG only).
+    GENERAL_CHAT_ENABLED: bool = True
+    GENERAL_CHAT_MAX_SENTENCES: int = Field(default=2, ge=1, le=3)
+
+    # --- Day 19: call summary + external task platforms ---------------------
+    # Deterministic summary built from the conversation state at call end and
+    # submitted to the practice backend (which mirrors it to Jira). Opt-out.
+    CALL_SUMMARY_ENABLED: bool = True
+    # deterministic | llm. Deterministic keeps the transcript server-side; the
+    # LLM option is opt-in only (it sends an excerpt to the configured model).
+    CALL_SUMMARY_PROVIDER: Literal["deterministic", "llm"] = "deterministic"
+    # Include a short transcript excerpt in the call record/Jira issue.
+    CALL_SUMMARY_INCLUDE_TRANSCRIPT: bool = False
+    # Hard ceiling on how long the end-of-call summary may delay teardown.
+    CALL_SUMMARY_TIMEOUT: float = Field(default=2.0, gt=0, le=10.0)
+
     # --- Day 5: LLM conversation engine -------------------------------------
     LLM_MODEL: str = "gemini-3.8-flash"
     LLM_API_KEY: str | None = None

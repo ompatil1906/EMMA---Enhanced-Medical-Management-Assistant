@@ -10,6 +10,20 @@ import {
   Min,
 } from 'class-validator';
 
+/** External task-platform modes (Jira). */
+export enum JiraMode {
+  Disabled = 'disabled',
+  Mock = 'mock',
+  Live = 'live',
+}
+
+/** How much of the intake form may leave the practice for an external issue. */
+export enum JiraPiiMode {
+  Full = 'full',
+  Masked = 'masked',
+  None = 'none',
+}
+
 /**
  * Supported database drivers.
  *
@@ -76,6 +90,64 @@ export class EnvVariables {
   @IsOptional()
   @IsString({ message: 'CORS_ORIGINS must be a comma-separated list of origins' })
   CORS_ORIGINS: string = 'http://localhost:5173';
+
+  // --- Day 19: Jira mirror -------------------------------------------------
+  /**
+   * `disabled` (off), `mock` (offline/demo — no network) or `live` (Atlassian
+   * Cloud REST v3). `live` without credentials fails fast at startup; there is
+   * no silent fallback to mock.
+   */
+  @IsOptional()
+  JIRA_MODE: JiraMode = JiraMode.Disabled;
+
+  /** Atlassian site root, e.g. https://example.atlassian.net (no trailing slash). */
+  @IsOptional()
+  @Matches(/^https:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?(?:\/[^\s]*)?$/, {
+    message:
+      'JIRA_BASE_URL must be an https:// URL such as https://example.atlassian.net (value not echoed)',
+  })
+  JIRA_BASE_URL: string | undefined = undefined;
+
+  @IsOptional()
+  @IsString({ message: 'JIRA_EMAIL must be the Atlassian account email' })
+  JIRA_EMAIL: string | undefined = undefined;
+
+  /** API token — never logged, never echoed in an error message. */
+  @IsOptional()
+  @IsString({ message: 'JIRA_API_TOKEN must be an Atlassian API token' })
+  JIRA_API_TOKEN: string | undefined = undefined;
+
+  @IsOptional()
+  @Matches(/^[A-Z][A-Z0-9_]{1,19}$/, {
+    message: 'JIRA_PROJECT_KEY must look like a Jira project key (e.g. EMMA)',
+  })
+  JIRA_PROJECT_KEY: string | undefined = undefined;
+
+  @IsOptional()
+  @Matches(/^[A-Z][A-Z0-9_-]{1,63}$/, { message: 'JIRA_EPIC_KEY must be a Jira issue key' })
+  JIRA_EPIC_KEY: string | undefined = undefined;
+
+  /** `requestType:IssueType,...` — e.g. `appointment-request:Appointment` */
+  @IsOptional()
+  @IsString({ message: 'JIRA_ISSUE_TYPE_MAP must be a comma-separated requestType:IssueType list' })
+  JIRA_ISSUE_TYPE_MAP: string | undefined = undefined;
+
+  @IsOptional()
+  @IsEnum(JiraPiiMode, { message: 'JIRA_PII_MODE must be one of: full, masked, none' })
+  JIRA_PII_MODE: JiraPiiMode = JiraPiiMode.Masked;
+
+  @IsOptional()
+  @IsInt({ message: 'JIRA_TIMEOUT_MS must be an integer between 500 and 30000' })
+  @Min(500, { message: 'JIRA_TIMEOUT_MS must be an integer between 500 and 30000' })
+  @Max(30000, { message: 'JIRA_TIMEOUT_MS must be an integer between 500 and 30000' })
+  @Transform(
+    ({ value }) => {
+      if (value === undefined || value === '') return undefined;
+      return Number(value);
+    },
+    { toClassOnly: true },
+  )
+  JIRA_TIMEOUT_MS: number = 5000;
 }
 
 /**
@@ -134,6 +206,48 @@ export function validateEnv(rawConfig: Record<string, unknown>): EnvVariables {
     errors.push(
       'DB_URL is required when DB_DRIVER=mysql (expected mysql://user:pass@host:3306/database)',
     );
+  }
+
+  if (instance.JIRA_MODE !== undefined && !Object.values(JiraMode).includes(instance.JIRA_MODE)) {
+    errors.push('JIRA_MODE must be one of: disabled, mock, live');
+  }
+
+  if (instance.JIRA_PII_MODE !== undefined && !Object.values(JiraPiiMode).includes(instance.JIRA_PII_MODE)) {
+    errors.push('JIRA_PII_MODE must be one of: full, masked, none');
+  }
+
+  if (instance.JIRA_BASE_URL) {
+    const httpsUrl = /^https:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?(?:\/[^\s]*)?$/;
+    if (!httpsUrl.test(instance.JIRA_BASE_URL)) {
+      errors.push(
+        'JIRA_BASE_URL must be an https:// URL such as https://example.atlassian.net (value not echoed)',
+      );
+    }
+  }
+
+  if (instance.JIRA_PROJECT_KEY && !/^[A-Z][A-Z0-9_]{1,19}$/.test(instance.JIRA_PROJECT_KEY)) {
+    errors.push('JIRA_PROJECT_KEY must look like a Jira project key (e.g. EMMA)');
+  }
+
+  if (instance.JIRA_EPIC_KEY && !/^[A-Z][A-Z0-9_-]{1,63}$/.test(instance.JIRA_EPIC_KEY)) {
+    errors.push('JIRA_EPIC_KEY must be a Jira issue key');
+  }
+
+  if (instance.JIRA_MODE === JiraMode.Live) {
+    // Fail fast: a live integration without credentials would silently drop
+    // every record (no silent fallback to mock).
+    if (!instance.JIRA_BASE_URL) {
+      errors.push('JIRA_BASE_URL is required when JIRA_MODE=live');
+    }
+    if (!instance.JIRA_EMAIL) {
+      errors.push('JIRA_EMAIL is required when JIRA_MODE=live');
+    }
+    if (!instance.JIRA_API_TOKEN) {
+      errors.push('JIRA_API_TOKEN is required when JIRA_MODE=live');
+    }
+    if (!instance.JIRA_PROJECT_KEY) {
+      errors.push('JIRA_PROJECT_KEY is required when JIRA_MODE=live');
+    }
   }
 
   if (errors.length > 0) {

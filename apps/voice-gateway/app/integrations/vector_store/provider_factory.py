@@ -6,9 +6,8 @@ fail clearly — there is NEVER a silent mock fallback.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import logging
+from typing import TYPE_CHECKING
 
 from app.integrations.vector_store.base import VectorStoreProvider
 from app.integrations.vector_store.exceptions import VectorStoreProviderNotAvailable
@@ -89,7 +88,8 @@ class VectorStoreProviderFactory:
                 return self._instance
             except Exception as exc:
                 logger.warning(
-                    "Failed to initialize Qdrant vector store (%s: %s); falling back to in-memory store",
+                    "Failed to initialize Qdrant vector store (%s: %s); "
+                    "falling back to in-memory store",
                     type(exc).__name__,
                     exc,
                 )

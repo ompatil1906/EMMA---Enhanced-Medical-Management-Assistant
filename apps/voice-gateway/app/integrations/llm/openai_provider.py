@@ -169,7 +169,10 @@ class OpenAILLMProvider:
         Raises `LLMError` subclasses on failure. If a fallback provider is configured,
         automatically falls back to it when OpenAI fails (e.g. quota/credit issues).
         """
-        if self._fallback_provider is not None and time.monotonic() < OpenAILLMProvider._circuit_breaker_until:
+        if (
+            self._fallback_provider is not None
+            and time.monotonic() < OpenAILLMProvider._circuit_breaker_until
+        ):
             sec_model = getattr(self._fallback_provider, "_model", None) or "gemini-3.8-flash"
             sec_req = LLMRequest(
                 transcript=request.transcript,
@@ -190,7 +193,9 @@ class OpenAILLMProvider:
             err_str = str(exc)
             if "429" in err_str or "credits" in err_str or "quota" in err_str:
                 OpenAILLMProvider._circuit_breaker_until = time.monotonic() + 300.0
-                logger.warning("OpenAI quota/credits exhausted; circuit breaker open for 5m, using fallback")
+                logger.warning(
+                    "OpenAI quota/credits exhausted; circuit breaker open for 5m, using fallback"
+                )
             if self._fallback_provider is not None:
                 logger.warning(
                     "OpenAI failed (%s: %s); falling back to secondary provider %s",

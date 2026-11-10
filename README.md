@@ -35,6 +35,24 @@ The LLM is an **interpreter only**. A deterministic emergency guard runs before
 the LLM, embeddings, Qdrant, and the backend; on a match it speaks the fixed
 999 script and performs zero administrative actions.
 
+### Day 19 additions
+
+* **Named greeting.** The browser intake form's first name is carried server-side
+  (LiveKit participant name/metadata, or a `caller-first-name` query parameter on
+  the WebSocket fallback) so EMMA opens with *"Hello, Sarah."* — sanitised to
+  letters/hyphen/apostrophe, length-capped, and never spoken raw. No name →
+  the generic greeting.
+* **Everyday conversation.** Deterministic small talk (greetings, thanks,
+  goodbyes, time/date, identity) plus bounded general-knowledge answers
+  (≤2 sentences). Clinical questions are refused deterministically before any
+  model call; practice-specific questions stay on the RAG path and are never
+  answered from world knowledge.
+* **Call records in Jira.** At call end the gateway submits a deterministic
+  summary (intake form + narrative + tasks derived from captured requests) to the
+  practice API, which stores it and mirrors it to Jira as one issue per call.
+  Masking, modes (`disabled`/`mock`/`live`) and idempotency:
+  `docs/integrations/jira.md`.
+
 ## Architecture snapshot
 
 ```
@@ -136,19 +154,24 @@ committed. Variable **names** only (values never recorded):
 `QDRANT_URL` · `QDRANT_API_KEY` · `QDRANT_LOCAL_PATH` · `QDRANT_COLLECTION` ·
 `RETRIEVAL_TOP_K` · `RETRIEVAL_MIN_SCORE` · `RETRIEVAL_CHUNK_SIZE` ·
 `RETRIEVAL_CHUNK_OVERLAP` · `NEXT_PUBLIC_VOICE_GATEWAY_URL` · `BACKEND_URL` ·
-`FRONTEND_URL`
+`FRONTEND_URL` · `GENERAL_CHAT_ENABLED` · `GENERAL_CHAT_MAX_SENTENCES` ·
+`CALL_SUMMARY_ENABLED` · `CALL_SUMMARY_PROVIDER` ·
+`CALL_SUMMARY_INCLUDE_TRANSCRIPT` · `CALL_SUMMARY_TIMEOUT`
 
 ### Browser UI (`apps/ui/.env`)
 `NEXT_PUBLIC_VOICE_GATEWAY_URL`
 
 ### Practice API (`apps/practice-api/.env`)
-`APP_ENV` · `CORS_ORIGINS` · `DB_DRIVER` · `PORT` · `SQLITE_PATH`
+`APP_ENV` · `CORS_ORIGINS` · `DB_DRIVER` · `PORT` · `SQLITE_PATH` ·
+`JIRA_MODE` · `JIRA_BASE_URL` · `JIRA_EMAIL` · `JIRA_API_TOKEN` ·
+`JIRA_PROJECT_KEY` · `JIRA_ISSUE_TYPE_MAP` · `JIRA_EPIC_KEY` · `JIRA_PII_MODE` ·
+`JIRA_TIMEOUT_MS` (see `docs/integrations/jira.md`)
 
 Key switches: `VOICE_PIPELINE=speech|echo` · `VOICE_TRANSPORT=websocket|livekit` ·
 `STT_PROVIDER=azure|deepgram|mock` · `TTS_PROVIDER=azure|elevenlabs|mock` ·
 `LLM_PROVIDER=gemini|openai|mock` · `EMBEDDING_PROVIDER=gemini|mock` ·
 `VECTOR_STORE_PROVIDER=qdrant|mock` · `EXOTEL_MODE=simulation|live` (live
-requires `EXOTEL_API_KEY`/`EXOTEL_API_TOKEN`).
+requires `EXOTEL_API_KEY`/`EXOTEL_API_TOKEN`) · `JIRA_MODE=disabled|mock|live`.
 
 ## Tests / lint
 
@@ -213,6 +236,7 @@ docker compose down
 | `docs/runbooks/browser-voice-demo.md` | browser voice demo procedure |
 | `docs/runbooks/final-local-acceptance-testing.md` | acceptance checks |
 | `docs/integrations/exotel-protocol.md` | verified protocol facts vs gateway policy |
+| `docs/integrations/jira.md` | call summary → Jira: endpoints, modes, PII policy, idempotency |
 | `docs/runbooks/local-development.md` | exact commands + troubleshooting |
 | `REQUIREMENTS.md` / `ARCHITECTURE_DECISION_RECORD.md` / `EVALUATION_PLAN.md` / `RISKS_AND_ASSUMPTIONS.md` | Day-1 research |
 
@@ -226,6 +250,10 @@ docker compose down
 * **Live provider verification:** OpenAI GPT-6 Luna, Deepgram Flux, ElevenLabs
   Flash, and LiveKit are implemented but not live-tested — no credentials
   configured in this environment. `gpt-6-luna` model availability unverified.
+* **Jira live sync:** implemented against Atlassian Cloud REST v3 and exercised
+  in `mock` mode only. No live site/project/token was used, so the live request
+  path is unverified. General-knowledge answers are unverified against a live
+  model (they degrade to a deterministic fallback).
 * **LiveKit self-hosted server:** installed and started locally via
   `livekit-server --dev`, but not connected to a browser client (no browser
   automation available).

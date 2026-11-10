@@ -1,11 +1,15 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { HealthResponseDto } from './dto/health-responses.dto.js';
+import { JiraService } from '../integrations/jira/jira.service.js';
+import { HealthResponseDto, JiraHealthDto } from './dto/health-responses.dto.js';
 
 /** Simple DB connectivity probe: DataSource.isInitialized + `SELECT 1`. */
 @Injectable()
 export class HealthService {
-  constructor(@Inject(DataSource) private readonly dataSource: DataSource) {}
+  constructor(
+    @Inject(DataSource) private readonly dataSource: DataSource,
+    private readonly jira: JiraService,
+  ) {}
 
   public async getHealth(): Promise<HealthResponseDto> {
     const dbUp = await this.probeDatabase();
@@ -13,6 +17,11 @@ export class HealthService {
     health.status = 'ok';
     health.db = dbUp ? 'up' : 'down';
     health.uptimeSeconds = Math.floor(process.uptime());
+    const jira = this.jira.describe();
+    const jiraHealth = new JiraHealthDto();
+    jiraHealth.mode = jira.mode;
+    jiraHealth.ready = jira.ready;
+    health.jira = jiraHealth;
     return health;
   }
 
